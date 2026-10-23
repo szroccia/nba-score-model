@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+# Downloaded data is large and re-creatable with `python -m nbamodel fetch`.
+data/*.csv
+*.egg-info/

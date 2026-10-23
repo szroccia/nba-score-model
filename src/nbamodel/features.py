@@ -1,0 +1,82 @@
+"""Build model inputs: one row per team per game, predicting that team's points."""
+
+import pandas as pd
+
+from . import lineup, ratings
+
+FEATURES = [
+    "BASE_PTS",          # pace x (team offense + opponent defense - league average) / 100
+    "LINEUP_OFF_PTS",    # points gained or lost from who plays for this team tonight
+    "LINEUP_DEF_PTS",    # points gained or lost from who plays for the opponent tonight
+    "IS_HOME",
+    "REST",              # days off before this game, capped
+    "OPP_REST",
+    "B2B",               # second night of a back-to-back
+    "OPP_B2B",
+]
+
+
+def matchup_rows(games: pd.DataFrame, player_games: pd.DataFrame, impact: pd.DataFrame,
+                 date: pd.Timestamp, season: str, home_id: int, away_id: int,
+                 home_probs: dict, away_probs: dict, league: dict,
+                 home_roster: set | None = None, away_roster: set | None = None) -> list[dict]:
+    """Feature rows for both teams in one game, using only information from before the date.
+
+    Rosters are sets of player ids; without them, everyone from recent games is assumed
+    to still be on the team."""
+    rating = {t: ratings.team_rating(games, t, date, season, league) for t in (home_id, away_id)}
+    rest = {t: ratings.rest_days(games, t, date) for t in (home_id, away_id)}
+    adj = {
+        team: lineup.lineup_adjustment(lineup.recent_minutes(player_games, team, date, roster), probs, impact)
+        for team, roster, probs in ((home_id, home_roster, home_probs), (away_id, away_roster, away_probs))
+    }
+    pace = rating[home_id]["PACE"] * rating[away_id]["PACE"] / league["PACE"]
+    rows = []
+    for team, opp, is_home in ((home_id, away_id, 1), (away_id, home_id, 0)):
+        rows.append(
+            {
+                "TEAM_ID": team,
+                "OPP_TEAM_ID": opp,
+                "PACE_EXP": pace,
+                "ORTG": rating[team]["ORTG"],
+                "OPP_DRTG": rating[opp]["DRTG"],
+                "GAMES_PLAYED": rating[team]["GAMES"],
+                "SEASON_GAMES": rating[team]["CURRENT_GAMES"],
+                "BASE_PTS": pace / 100 * (rating[team]["ORTG"] + rating[opp]["DRTG"] - league["ORTG"]),
+                "LINEUP_OFF_PTS": pace / 100 * adj[team]["ORTG_DELTA"],
+                "LINEUP_DEF_PTS": pace / 100 * adj[opp]["DRTG_DELTA"],
+                "IS_HOME": is_home,
+                "REST": rest[team],
+                "OPP_REST": rest[opp],
+                "B2B": int(rest[team] == 0),
+                "OPP_B2B": int(rest[opp] == 0),
+                "MISSING": adj[team]["MISSING"],
+            }
+        )
+    return rows
+
+
+def historical_features(games: pd.DataFrame, player_games: pd.DataFrame, impact_by_season: dict,
+                        seasons: list[str]) -> pd.DataFrame:
+    """Features for every past game in the given seasons, plus the actual points scored.
+
+    Lineups use who actually played as that night's roster (perfect knowledge of
+    availability, but not of minutes)."""
+    out = []
+    played = player_games.groupby(["GAME_ID", "TEAM_ID"])["PLAYER_ID"].apply(set)
+    target = games[games["SEASON"].isin(seasons) & (games["IS_HOME"] == 1)]
+    league_cache: dict = {}
+    for g in target.itertuples():
+        date, season = g.GAME_DATE, g.SEASON
+        if (date, season) not in league_cache:
+            league_cache[(date, season)] = ratings.league_average(games, date, season)
+        rows = matchup_rows(games, player_games, impact_by_season[season], date, season,
+                            g.TEAM_ID, g.OPP_TEAM_ID, {}, {}, league_cache[(date, season)],
+                            played.get((g.GAME_ID, g.TEAM_ID), set()),
+                            played.get((g.GAME_ID, g.OPP_TEAM_ID), set()))
+        actual = {g.TEAM_ID: g.PTS, g.OPP_TEAM_ID: g.OPP_PTS}
+        for row in rows:
+            row.update({"GAME_ID": g.GAME_ID, "GAME_DATE": date, "SEASON": season,
+                        "PTS": actual[row["TEAM_ID"]]})
+            out.append(row)
+    return pd.DataFrame(out)

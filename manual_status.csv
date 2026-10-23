@@ -1,0 +1,4 @@
+# Your own player statuses. These override the official injury report.
+# STATUS is one of: out, doubtful, questionable, probable, available
+# TEAM is the three-letter code, e.g. BOS, LAL, GSW
+TEAM,PLAYER,STATUS
