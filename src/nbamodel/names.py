@@ -4,6 +4,8 @@ import re
 import unicodedata
 
 _SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
+# Players who go by a different first name in one source (after the cleanup below).
+_ALIASES = {"ron holland": "ronald holland"}
 
 
 def normalize_name(name: str) -> str:
@@ -15,5 +17,5 @@ def normalize_name(name: str) -> str:
         last, first = text.split(",", 1)
         text = f"{first} {last}"
     text = re.sub(r"[^a-zA-Z ]", "", text.replace("-", " ")).lower()
-    words = [w for w in text.split() if w not in _SUFFIXES]
-    return " ".join(words)
+    key = " ".join(w for w in text.split() if w not in _SUFFIXES)
+    return _ALIASES.get(key, key)

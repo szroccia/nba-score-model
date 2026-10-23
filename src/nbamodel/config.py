@@ -33,7 +33,9 @@ PLAY_PROBABILITY = {
 # Player impact (Box Plus/Minus) for players with no BPM on record.
 REPLACEMENT_OBPM = -1.5
 REPLACEMENT_DBPM = -0.5
-# Minutes of current-season play needed before current BPM outweighs last season's.
+# Minutes of current-season play at which this season's BPM counts as much as last season's.
+# Half of it also pulls players with few minutes last season toward replacement level
+# (250 minutes last season: half his own BPM, half replacement).
 BPM_PRIOR_MINUTES = 500
 
 # Recent minutes: exponentially weighted over a player's last games for his team.
@@ -41,8 +43,13 @@ MINUTES_HALF_LIFE_GAMES = 5
 # Players who usually play at least this many minutes when available count as rotation players.
 ROTATION_MINUTES = 20
 
+# `predict --push` (which run_daily uses) commits the predictions folder to this branch of
+# this git remote, on its own, apart from the code and whatever branch is checked out.
+PREDICTIONS_REMOTE = "dev"
+PREDICTIONS_BRANCH = "predictions"
+
 # Bump when feature calculations change, so cached features are rebuilt.
-FEATURE_VERSION = 4
+FEATURE_VERSION = 5
 
 # Rest days are capped: 3+ days off is treated the same as 3.
 MAX_REST_DAYS = 3

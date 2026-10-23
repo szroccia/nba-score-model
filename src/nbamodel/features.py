@@ -2,7 +2,7 @@
 
 import pandas as pd
 
-from . import lineup, ratings
+from . import config, lineup, ratings
 
 FEATURES = [
     "BASE_PTS",          # pace x (team offense + opponent defense - league average) / 100
@@ -14,6 +14,26 @@ FEATURES = [
     "B2B",               # second night of a back-to-back
     "OPP_B2B",
 ]
+
+
+def settings() -> dict:
+    """Every setting that changes the features. Saved features are reused only when all of
+    these match, so changing any of them (to tune it, say) rebuilds the features."""
+    return {
+        "feature_version": config.FEATURE_VERSION,
+        "playoff_games": config.PLAYOFF_GAMES,
+        "half_life": config.RATING_HALF_LIFE_GAMES,
+        "prior_season_weight": config.PRIOR_SEASON_GAME_WEIGHT,
+        "shrink_games": config.SHRINK_GAMES,
+        "replacement_obpm": config.REPLACEMENT_OBPM,
+        "replacement_dbpm": config.REPLACEMENT_DBPM,
+        "bpm_prior_minutes": config.BPM_PRIOR_MINUTES,
+        "minutes_half_life": config.MINUTES_HALF_LIFE_GAMES,
+        "rotation_minutes": config.ROTATION_MINUTES,
+        "max_rest_days": config.MAX_REST_DAYS,
+        "active_window_games": lineup.ACTIVE_WINDOW_GAMES,
+        "team_minutes": lineup.TEAM_MINUTES,
+    }
 
 
 def matchup_rows(games: pd.DataFrame, player_games: pd.DataFrame, impact: pd.DataFrame,

@@ -6,7 +6,7 @@ The major modeling choices, what was considered, the evidence and the reason for
 
 | # | Decision | Choice | Evidence |
 | --- | --- | --- | --- |
-| 1 | [Model approach](#1-model-approach) | Team ratings + ridge regression | Beats the plain formula every season |
+| 1 | [Model approach](#1-model-approach) | Team ratings + ridge regression | Beats the plain formula in every validation season |
 | 2 | [Data sources](#2-data-sources) | Official NBA stats and injury report, run from a home connection | Most reliable sources; cloud servers are blocked |
 | 3 | [Player value](#3-player-value) | Box Plus/Minus, weighted by expected minutes | Lineup inputs earn real weight in the regression |
 | 4 | [Offseason roster moves](#4-offseason-roster-moves) | Current rosters shift last season's ratings | Needed for October, when ratings are mostly last season |
@@ -25,7 +25,7 @@ The major modeling choices, what was considered, the evidence and the reason for
 
 **Choice: B.** The regression learns how much to trust each input instead of fixing the weights by hand, and its coefficients can be read directly ([What the model learned](../README.md#what-the-model-learned)). C can find interactions but is harder to explain and needs more features. It is planned as a later comparison, judged by the same evaluation.
 
-**Evidence.** On average the regression's margin error is 0.13 to 0.24 points lower than the formula's in every backtest season:
+**Evidence.** The regression's average margin error is 0.16 and 0.24 points lower than the formula's in the two validation seasons:
 
 ![Regression vs formula](figures/model_vs_formula.png)
 
@@ -46,7 +46,7 @@ stats.nba.com blocks cloud servers, so the data steps run on a home computer. A 
 
 ## 3. Player value
 
-**Choice: Box Plus/Minus (BPM),** split into offense and defense. Each player's value is weighted by the minutes he is expected to play tonight compared with recent games. Last season's BPM is blended with this season's until a player has about 500 minutes.
+**Choice: Box Plus/Minus (BPM),** split into offense and defense. Each player's value is weighted by the minutes he is expected to play tonight compared with recent games. Last season's BPM is blended with this season's: they count equally once a player has 500 minutes this season, and this season's counts more after that.
 
 **Why.** BPM exists for every player in every season, separates offense from defense, and is public, so anyone can check it.
 
@@ -70,7 +70,7 @@ In October, team ratings are mostly last season's games, so this is what account
 
 **Why.**
 - **No look-ahead:** basketball data is a time series, so random k-fold splits would train on games played after the ones being predicted. Refitting before each month and predicting that month is also exactly how the live model runs.
-- **Untouched test season:** 2025-26 is never used to choose anything. Every look at it is appended to `results/test_log.md`.
+- **Untouched test season:** 2025-26 is never used to choose anything. Every look at it is appended to `results/test_log.md`. One earlier look is on record here instead: the first backtest, run in October 2026 before this lock existed, also scored 2025-26 (margin error 11.33 for the regression, 11.46 for the formula). It showed the same thing as the other seasons and settled nothing they didn't. Since then `backtest` leaves the test season out.
 - **A rule fixed in advance:** settings are ranked by margin error, then total error, then total bias nearest zero, with near-ties going to the simpler model.
 - **A real bar to beat:** the closing line is the best public forecast.
 
@@ -102,7 +102,7 @@ In October, team ratings are mostly last season's games, so this is what account
 
 **Choice: alpha = 10.**
 - Every alpha from 0.01 to 100 gives the same validation error (10.95).
-- With about 10,000 games and only 8 inputs, a small penalty barely moves the coefficients.
+- With about 10,000 team-games (5,000 games) and only 8 inputs, a small penalty barely moves the coefficients.
 - Under the selection rule, ties go to the simpler (more regularized) model, which is 10.
 - Error only rises once alpha reaches 1,000 and starts shrinking real effects.
 

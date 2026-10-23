@@ -9,20 +9,16 @@ from sklearn.linear_model import Ridge
 from . import config
 from .features import FEATURES
 
-# Early-season ratings are mostly last season's; skip a team's first games when training.
-MIN_GAMES_FOR_TRAINING = 10
-
 
 def fit(train: pd.DataFrame, alpha: float | None = None) -> dict:
-    rows = train[train["GAMES_PLAYED"] >= MIN_GAMES_FOR_TRAINING]
     alpha = config.RIDGE_ALPHA if alpha is None else alpha
-    ridge = Ridge(alpha=alpha).fit(rows[FEATURES], rows["PTS"])
+    ridge = Ridge(alpha=alpha).fit(train[FEATURES], train["PTS"])
     return {
         "intercept": float(ridge.intercept_),
         "coefficients": dict(zip(FEATURES, map(float, ridge.coef_))),
         "alpha": alpha,
-        "trained_on_rows": int(len(rows)),
-        "seasons": sorted(rows["SEASON"].unique().tolist()),
+        "trained_on_rows": int(len(train)),
+        "seasons": sorted(train["SEASON"].unique().tolist()),
     }
 
 

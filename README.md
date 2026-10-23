@@ -85,7 +85,7 @@ Each run also pulls every team's current roster. Players who have left a team ar
 `python -m nbamodel evaluate` is the yardstick for every modeling change:
 
 - **Rolling-origin cross-validation.** For each month of the validation seasons, the regression is refit on every earlier game and predicts that month, which is how the live model runs. No fold trains on a later game.
-- **A locked test season.** 2025-26 is never used to choose anything. `evaluate --final` scores it with the current settings and appends the result, commit and settings to `results/test_log.md`, so every look at the test set is on record.
+- **A locked test season.** 2025-26 is never used to choose anything. `evaluate --final` scores it with the current settings and appends the result, commit and settings to `results/test_log.md`, so every look at the test set is on record (one early look, from before the lock, is noted in the [decision log](docs/decisions.md#5-evaluation-design)).
 - **A selection rule fixed in advance.** Margin error, then total error, then total bias nearest zero; near-ties go to the simpler model.
 - **Complexity and learning curves** for ridge strength and for how much history the model needs.
 - **Vegas benchmark.** Closing spreads and totals from ESPN's public API, compared game by game.
@@ -137,7 +137,7 @@ python -m nbamodel explain --game BOS   # chart of how one game's prediction is 
 
 ## Daily updates
 
-`run_daily.sh` (Mac/Linux) or `run_daily.bat` (Windows) refreshes this season's data, reads the latest injury report, writes `predictions/<date>.csv` and pushes it to GitHub. Run it twice a day: once in the morning and once about an hour before the first game.
+`run_daily.sh` (Mac/Linux) or `run_daily.bat` (Windows) refreshes this season's data, reads the latest injury report, writes `predictions/<date>.csv` and pushes the predictions folder to a `predictions` branch on the git remote set in `config.PREDICTIONS_REMOTE`, kept apart from the code. Run it twice a day: once in the morning and once about an hour before the first game.
 
 Mac/Linux, with `crontab -e` (times are your computer's local time):
 

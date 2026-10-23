@@ -20,6 +20,9 @@ STATUSES = ["Out", "Doubtful", "Questionable", "Probable", "Available"]
 _PLAYER_RE = re.compile(
     r"(?P<name>[A-Z][\w.'\- ]*?, [A-Z][\w.'\- ]*?)\s+(?P<status>" + "|".join(STATUSES) + r")\b\s*(?P<reason>.*)"
 )
+# Each game's first row starts with its date and tip-off time, e.g. '10/21/2026 07:30 (ET)'.
+_DATE_RE = re.compile(r"(\d{2}/\d{2}/\d{4})\s+\d{1,2}:\d{2}\s*\(ET\)")
+NOT_SUBMITTED = "not yet submitted"
 _TEAM_ALIASES = {"LA Clippers": "LAC"}
 
 
@@ -63,30 +66,48 @@ def latest_report(now: datetime | None = None) -> tuple[str, bytes] | None:
 
 
 def parse_report_text(text: str, team_names: dict) -> pd.DataFrame:
-    """Pull (team, player, status, reason) rows out of the report's text.
+    """Pull (game date, team, player, status, reason) rows out of the report's text.
 
-    Rows look like '... Boston Celtics Tatum, Jayson Out Injury/Illness - Right Achilles'.
-    A row without a team name belongs to the last team seen."""
+    Rows look like '10/21/2026 07:30 (ET) LAL@BOS Boston Celtics Tatum, Jayson Out Injury/Illness'.
+    A row without a date or team belongs to the last one seen. One report covers more than one
+    day of games, so the game date matters. A team that hasn't filed yet gets one row with
+    status "not yet submitted" and no player."""
     rows = []
-    team = None
+    team = game_date = None
     pattern = re.compile("|".join(re.escape(n) for n in sorted(team_names, key=len, reverse=True)))
     for line in text.splitlines():
+        dated = _DATE_RE.search(line)
+        if dated:
+            game_date = pd.to_datetime(dated.group(1), format="%m/%d/%Y")
         found = pattern.search(line)
         rest = line
         if found:
             team = team_names[found.group(0)]
             rest = line[found.end():]
+            if "NOT YET SUBMITTED" in rest.upper():
+                rows.append({"GAME_DATE": game_date, "TEAM": team, "PLAYER": "", "STATUS": NOT_SUBMITTED,
+                             "REASON": ""})
+                continue
         match = _PLAYER_RE.search(rest)
         if team and match:
             rows.append(
                 {
+                    "GAME_DATE": game_date,
                     "TEAM": team,
                     "PLAYER": match.group("name").strip(),
                     "STATUS": match.group("status").lower(),
                     "REASON": match.group("reason").strip(),
                 }
             )
-    return pd.DataFrame(rows, columns=["TEAM", "PLAYER", "STATUS", "REASON"])
+    return pd.DataFrame(rows, columns=["GAME_DATE", "TEAM", "PLAYER", "STATUS", "REASON"])
+
+
+def for_date(statuses: pd.DataFrame, day: pd.Timestamp) -> pd.DataFrame:
+    """The rows for games on one day. Rows without a date (manual overrides) always apply."""
+    dates = pd.to_datetime(statuses["GAME_DATE"]) if "GAME_DATE" in statuses else None
+    if dates is None:
+        return statuses
+    return statuses[dates.isna() | (dates == day.normalize())]
 
 
 def report_text(pdf_bytes: bytes) -> str:
@@ -106,7 +127,7 @@ def manual_overrides() -> pd.DataFrame:
     They win over the official report, e.g. for late scratches."""
     path = config.MANUAL_STATUS_PATH
     if not path.exists():
-        return pd.DataFrame(columns=["TEAM", "PLAYER", "STATUS", "REASON"])
+        return pd.DataFrame(columns=["GAME_DATE", "TEAM", "PLAYER", "STATUS", "REASON"])
     df = pd.read_csv(path, comment="#")
     df["STATUS"] = df["STATUS"].str.strip().str.lower()
     df["REASON"] = "manual"

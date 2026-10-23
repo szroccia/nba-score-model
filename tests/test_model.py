@@ -10,6 +10,7 @@ def test_normalize_name_matches_across_sources():
     assert normalize_name("Dončić, Luka") == normalize_name("Luka Doncic") == "luka doncic"
     assert normalize_name("Jackson Jr., Jaren") == normalize_name("Jaren Jackson Jr.")
     assert normalize_name("Gilgeous-Alexander, Shai") == normalize_name("Shai Gilgeous-Alexander")
+    assert normalize_name("Ron Holland") == normalize_name("Holland II, Ronald") == "ronald holland"
 
 
 def test_parse_injury_report_text():
@@ -26,10 +27,34 @@ def test_parse_injury_report_text():
         ["BOS", "Tatum, Jayson", "out"],
         ["BOS", "Brown, Jaylen", "questionable"],
         ["LAL", "James, LeBron", "probable"],
+        ["LAC", "", injuries.NOT_SUBMITTED],
     ]
+    assert (df["GAME_DATE"] == pd.Timestamp("2026-10-21")).all()
     probs = injuries.play_probabilities(df)
     assert probs["BOS"]["jayson tatum"] == 0.0
     assert probs["LAL"]["lebron james"] == 0.9
+    assert "LAC" not in probs
+
+
+def test_injury_report_uses_only_the_day_predicted():
+    """A report covers two days. A team on a back-to-back must get tonight's status, not tomorrow's."""
+    names = {"Boston Celtics": "BOS", "Detroit Pistons": "DET", "Los Angeles Lakers": "LAL"}
+    text = "\n".join([
+        "Injury Report: 10/20/26 06:00 PM",
+        "10/20/2026 07:00 (ET) BOS@DET Boston Celtics Brown, Jaylen Out Injury/Illness - Left Ankle Sprain",
+        "10/21/2026 07:30 (ET) LAL@BOS Boston Celtics Brown, Jaylen Questionable Injury/Illness - Left Ankle Sprain",
+        "Los Angeles Lakers NOT YET SUBMITTED",
+    ])
+    df = injuries.parse_report_text(text, names)
+    tonight = injuries.play_probabilities(injuries.for_date(df, pd.Timestamp("2026-10-20")))
+    tomorrow = injuries.for_date(df, pd.Timestamp("2026-10-21"))
+    assert tonight["BOS"]["jaylen brown"] == 0.0
+    assert injuries.play_probabilities(tomorrow)["BOS"]["jaylen brown"] == 0.5
+    assert tomorrow.loc[tomorrow["TEAM"] == "LAL", "STATUS"].tolist() == [injuries.NOT_SUBMITTED]
+    # Manual overrides have no date and always apply.
+    manual = pd.DataFrame({"TEAM": ["BOS"], "PLAYER": ["Jaylen Brown"], "STATUS": ["available"]})
+    both = injuries.for_date(pd.concat([df, manual], ignore_index=True), pd.Timestamp("2026-10-20"))
+    assert injuries.play_probabilities(both)["BOS"]["jaylen brown"] == 1.0
 
 
 def _fake_league(seasons=("2023-24", "2024-25"), n_teams=4, seed=0):
@@ -253,12 +278,17 @@ def test_backtest_comparison_runs(monkeypatch, tmp_path):
     feats = features.historical_features(games, player_games, {s: empty for s in ("2024-25", "2025-26")},
                                          ["2024-25", "2025-26"])
     monkeypatch.setattr(config, "TRAIN_SEASONS", ["2024-25", "2025-26"])
+    monkeypatch.setattr(config, "TEST_SEASON", "2026-27")
     monkeypatch.setattr(config, "ROOT", tmp_path)
     monkeypatch.setattr(cli, "_historical", lambda seasons: feats)
     cli.main(["backtest", "--playoffs", "all"])
     table = (tmp_path / "results" / "playoff_comparison.md").read_text()
     assert "Ridge (B), first 15 games, playoffs relative" in table
     assert table.count("| 2025-26 |") == 9
+    # The locked test season never shows up in a backtest.
+    monkeypatch.setattr(config, "TEST_SEASON", "2025-26")
+    cli.main(["backtest"])
+    assert "| 2025-26 |" not in (tmp_path / "results" / "backtest.md").read_text()
 
 
 def _fake_features(seasons=("2022-23", "2023-24", "2024-25", "2025-26"), n_teams=6, seed=1):
@@ -406,3 +436,75 @@ def test_bpm_before_it_is_published(monkeypatch, tmp_path):
     df = data.bpm("2026-27", refresh=True)
     assert df.empty and list(df.columns) == ["Player", "MP", "OBPM", "DBPM", "BPM"]
     assert lineup.player_impact(data.bpm("2025-26", refresh=True), df).empty
+
+
+def test_warns_when_report_does_not_cover_a_team(capsys):
+    from nbamodel import cli
+
+    names = {"Boston Celtics": "BOS", "Los Angeles Lakers": "LAL"}
+    df = injuries.parse_report_text("\n".join([
+        "10/21/2026 07:30 (ET) LAL@BOS Boston Celtics Brown, Jaylen Out Injury/Illness - Left Ankle Sprain",
+        "Los Angeles Lakers NOT YET SUBMITTED",
+    ]), names)
+    day = pd.Timestamp("2026-10-21")
+    cli._warn_unreported(df, injuries.for_date(df, day), {"BOS", "LAL"}, day)
+    assert "not yet submitted to the injury report: LAL" in capsys.readouterr().out
+    other = pd.Timestamp("2026-10-23")
+    cli._warn_unreported(df, injuries.for_date(df, other), {"BOS", "LAL"}, other)
+    assert "covers 2026-10-21, not 2026-10-23" in capsys.readouterr().out
+
+
+def test_saved_features_rebuild_when_a_setting_changes(monkeypatch, tmp_path):
+    from nbamodel import cli, config
+
+    builds = []
+
+    def build(games, players, impact, seasons):
+        builds.append(config.SHRINK_GAMES)
+        return pd.DataFrame({"SEASON": seasons, "GAME_DATE": pd.Timestamp("2025-01-01")})
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(cli, "_load", lambda seasons: (None, None))
+    monkeypatch.setattr(cli.data, "bpm", lambda season: None)
+    monkeypatch.setattr(cli.lineup, "player_impact", lambda bpm: None)
+    monkeypatch.setattr(cli.features, "historical_features", build)
+    cli._historical(["2024-25"])
+    cli._historical(["2024-25"])          # same settings: reuses the saved file
+    monkeypatch.setattr(config, "SHRINK_GAMES", 8)
+    cli._historical(["2024-25"])          # a tuning change: rebuilt, not the stale file
+    assert builds == [4, 8]
+
+
+def test_push_predictions_uses_its_own_branch(monkeypatch, tmp_path):
+    """Predictions go to their own branch on the remote; the checked-out branch is untouched."""
+    import subprocess
+
+    from nbamodel import cli, config
+
+    def git(*cmd, cwd):
+        return subprocess.run(["git", *cmd], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+    for var, value in (("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"),
+                       ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")):
+        monkeypatch.setenv(var, value)
+    remote, repo = tmp_path / "remote.git", tmp_path / "repo"
+    git("init", "-q", "--bare", str(remote), cwd=tmp_path)
+    git("init", "-q", str(repo), cwd=tmp_path)
+    (repo / "code.py").write_text("x = 1\n")
+    git("add", "code.py", cwd=repo)
+    git("commit", "-q", "-m", "code", cwd=repo)
+    git("remote", "add", "dev", str(remote), cwd=repo)
+    head = git("rev-parse", "HEAD", cwd=repo)
+    monkeypatch.setattr(config, "ROOT", repo)
+    monkeypatch.setattr(config, "PREDICTIONS_DIR", repo / "predictions")
+    (repo / "predictions").mkdir()
+    (repo / "predictions" / "2026-10-22.csv").write_text("a\n")
+    cli.push_predictions("2026-10-22")
+    (repo / "predictions" / "2026-10-23.csv").write_text("b\n")
+    cli.push_predictions("2026-10-23")
+    cli.push_predictions("2026-10-23")      # nothing new: no extra commit
+    files = git("ls-tree", "-r", "--name-only", "predictions", cwd=remote).splitlines()
+    assert files == ["predictions/2026-10-22.csv", "predictions/2026-10-23.csv"]
+    assert git("rev-list", "--count", "predictions", cwd=remote) == "2"
+    assert git("rev-parse", "HEAD", cwd=repo) == head          # the code branch didn't move
+    assert git("status", "--porcelain", "--", "code.py", cwd=repo) == ""

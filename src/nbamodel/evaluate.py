@@ -12,20 +12,17 @@ import subprocess
 import numpy as np
 import pandas as pd
 
-from . import config, model
+from . import config, features, model
 
 def monthly_folds(feats: pd.DataFrame, seasons: list[str]):
     """(season, month, training rows, test rows) for every month of the given seasons.
 
-    Training rows are every game before the month starts; test rows are that month's games
-    in which both teams have enough history to be rated (the same rule training uses)."""
+    Training rows are every game before the month starts; test rows are that month's games."""
     month = feats["GAME_DATE"].dt.to_period("M")
     for season in seasons:
         for m in sorted(month[feats["SEASON"] == season].unique()):
             train = feats[feats["GAME_DATE"] < m.start_time]
             test = feats[(feats["SEASON"] == season) & (month == m)]
-            rated = test.groupby("GAME_ID")["GAMES_PLAYED"].min() >= model.MIN_GAMES_FOR_TRAINING
-            test = test[test["GAME_ID"].isin(rated[rated].index)]
             if not train.empty and not test.empty:
                 yield season, str(m), train, test
 
@@ -73,7 +70,7 @@ def cross_validate(feats: pd.DataFrame, seasons: list[str], alpha: float | None 
     With max_train_rows, each fit uses only the most recent rows of its training data."""
     preds, train_scores = [], []
     for season, month, train, test in monthly_folds(feats, seasons):
-        train = train[train["GAMES_PLAYED"] >= model.MIN_GAMES_FOR_TRAINING].sort_values("GAME_DATE")
+        train = train.sort_values("GAME_DATE")
         if max_train_rows is not None:
             if len(train) < max_train_rows:
                 continue
@@ -119,8 +116,7 @@ def learning_curve(feats: pd.DataFrame, season: str, sizes: list[int]) -> pd.Dat
 
     Uses only folds that have at least the largest size available, so every size is
     scored on the same months."""
-    available = [len(train[train["GAMES_PLAYED"] >= model.MIN_GAMES_FOR_TRAINING])
-                 for _, _, train, _ in monthly_folds(feats, [season])]
+    available = [len(train) for _, _, train, _ in monthly_folds(feats, [season])]
     sizes = [n for n in sizes if available and n <= min(available)]
     rows = []
     for n in sizes:
@@ -148,9 +144,7 @@ def vegas_comparison(preds: pd.DataFrame, vegas_lines: pd.DataFrame) -> pd.DataF
 
 
 def settings() -> dict:
-    return {"alpha": config.RIDGE_ALPHA, "playoff_games": config.PLAYOFF_GAMES,
-            "half_life": config.RATING_HALF_LIFE_GAMES, "prior_season_weight": config.PRIOR_SEASON_GAME_WEIGHT,
-            "shrink_games": config.SHRINK_GAMES, "feature_version": config.FEATURE_VERSION}
+    return {"alpha": config.RIDGE_ALPHA, **features.settings()}
 
 
 def _md_table(df: pd.DataFrame, columns: dict) -> list[str]:

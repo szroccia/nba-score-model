@@ -12,7 +12,9 @@
 """
 
 import argparse
+import hashlib
 import json
+import os
 import subprocess
 from datetime import date as date_cls
 
@@ -56,8 +58,9 @@ def cmd_fetch(args):
 
 
 def _historical(seasons: list[str]) -> pd.DataFrame:
-    # One cache per feature version and playoff setting, so stale features are never reused.
-    path = config.DATA_DIR / f"features_v{config.FEATURE_VERSION}_playoffs-{config.PLAYOFF_GAMES}.csv"
+    # One cache per combination of feature settings, so stale features are never reused.
+    fingerprint = hashlib.sha1(json.dumps(features.settings(), sort_keys=True).encode()).hexdigest()[:8]
+    path = config.DATA_DIR / f"features_v{config.FEATURE_VERSION}_playoffs-{config.PLAYOFF_GAMES}_{fingerprint}.csv"
     if path.exists():
         cached = pd.read_csv(path, parse_dates=["GAME_DATE"])
         if set(seasons) <= set(cached["SEASON"]):
@@ -88,8 +91,10 @@ def _backtest_rows(label: str = "") -> list[str]:
     feats = _historical(config.TRAIN_SEASONS)
     lines = []
     for i, season in enumerate(config.TRAIN_SEASONS[1:], start=1):
+        if season >= config.TEST_SEASON:  # the locked test season is scored only by `evaluate --final`
+            continue
         train = feats[feats["SEASON"].isin(config.TRAIN_SEASONS[:i])]
-        test = feats[(feats["SEASON"] == season) & (feats["GAMES_PLAYED"] >= model.MIN_GAMES_FOR_TRAINING)].copy()
+        test = feats[feats["SEASON"] == season].copy()
         fitted = model.fit(train)
         test["PRED_PTS"] = model.predict(fitted, test)
         # Option A from the plan for comparison: the ratings formula plus a fixed home edge.
@@ -110,7 +115,8 @@ def _backtest_rows(label: str = "") -> list[str]:
 
 def cmd_backtest(args):
     intro = ["Each season is predicted by a model trained only on earlier seasons.",
-             "Lineups use who actually played; ratings use only games before each date."]
+             "Lineups use who actually played; ratings use only games before each date.",
+             f"The locked test season ({config.TEST_SEASON}) is left out; only `evaluate --final` scores it."]
     if args.playoffs == "all":
         lines = ["# Playoff games in ratings: comparison", ""] + intro + [""] + TABLE_HEADER
         for mode in ("include", "exclude", "relative"):
@@ -194,11 +200,28 @@ def cmd_explain(args):
 def _warn_unmatched(statuses: pd.DataFrame, players: pd.DataFrame, teams: set) -> None:
     """Point out listed players whose names don't match anyone in the box scores."""
     known = set(players["PLAYER_NAME"].map(normalize_name))
-    listed = statuses[statuses["TEAM"].isin(teams)]
+    listed = statuses[statuses["TEAM"].isin(teams) & (statuses["STATUS"] != injuries.NOT_SUBMITTED)]
     unmatched = [p for p in listed["PLAYER"] if normalize_name(p) not in known]
     if unmatched:
         print(f"Note: {len(unmatched)} listed players not found in box scores (rookies or name mismatches): "
               + ", ".join(unmatched[:10]))
+
+
+def _warn_unreported(parsed: pd.DataFrame, on_day: pd.DataFrame, playing: set, day: pd.Timestamp) -> None:
+    """Point out teams playing today that the injury report doesn't cover yet. Their players are
+    all assumed available, including anyone out long term."""
+    if on_day.empty and not parsed.empty:
+        dates = ", ".join(sorted(str(d.date()) for d in pd.to_datetime(parsed["GAME_DATE"]).dropna().unique()))
+        print(f"Warning: the latest injury report covers {dates}, not {day.date()}. "
+              "Every player is assumed available.")
+        return
+    pending = sorted(set(on_day.loc[on_day["STATUS"] == injuries.NOT_SUBMITTED, "TEAM"]) & playing)
+    if pending:
+        print(f"Warning: not yet submitted to the injury report: {', '.join(pending)}. "
+              "Their players are assumed available; run again later.")
+    absent = sorted(playing - set(on_day["TEAM"]))
+    if absent and not parsed.empty:
+        print(f"Note: nobody listed on the injury report for {', '.join(absent)}.")
 
 
 def cmd_injuries(args):
@@ -218,12 +241,19 @@ def cmd_injuries(args):
     config.DATA_DIR.mkdir(exist_ok=True)
     out.write_text(text, encoding="utf-8")
     parsed = injuries.parse_report_text(text, injuries._team_names())
+    pending = parsed[parsed["STATUS"] == injuries.NOT_SUBMITTED]
+    parsed = parsed[parsed["STATUS"] != injuries.NOT_SUBMITTED]
     print(f"{len(parsed)} players read from the report")
     if parsed.empty:
         print("First lines of the PDF text (full text saved to", out, "):")
         print("\n".join(text.splitlines()[:40]))
         return
-    print(parsed.groupby(["TEAM", "STATUS"]).size().unstack(fill_value=0).to_string())
+    for game_date, rows in parsed.groupby("GAME_DATE", dropna=False):
+        label = "no date found" if pd.isna(game_date) else f"games on {game_date.date()}"
+        print(f"\n{label}:")
+        print(rows.groupby(["TEAM", "STATUS"]).size().unstack(fill_value=0).to_string())
+    if not pending.empty:
+        print("\nNot yet submitted:", ", ".join(sorted(set(pending["TEAM"]))))
     print()
     print(parsed.head(25).to_string(index=False))
 
@@ -243,21 +273,26 @@ def predict_date(day: pd.Timestamp, use_injury_report: bool = True, refresh: boo
 
     statuses = []
     source = "none"
+    playing = set(today["HOME_TEAM"]) | set(today["AWAY_TEAM"])
     if use_injury_report:
         found = injuries.latest_report()
         if found:
             source, pdf = found
             parsed = injuries.parse_report_pdf(pdf)
-            print(f"Injury report: {source} ({len(parsed)} players listed)")
             if parsed.empty:
                 print("Warning: the injury report had no readable players. Run `python -m nbamodel injuries`.")
-            statuses.append(parsed)
+            # A report covers more than one day of games; keep only this day's rows.
+            on_day = injuries.for_date(parsed, day)
+            print(f"Injury report: {source} ({(on_day['STATUS'] != injuries.NOT_SUBMITTED).sum()} "
+                  f"players listed for {day.date()})")
+            _warn_unreported(parsed, on_day, playing, day)
+            statuses.append(on_day)
         else:
             print("Warning: no injury report found in the last 24 hours. Run `python -m nbamodel injuries`.")
     statuses.append(injuries.manual_overrides())
     all_statuses = pd.concat(statuses, ignore_index=True)
     probs = injuries.play_probabilities(all_statuses)
-    _warn_unmatched(all_statuses, players, set(today["HOME_TEAM"]) | set(today["AWAY_TEAM"]))
+    _warn_unmatched(all_statuses, players, playing)
 
     impact = lineup.player_impact(data.bpm(prev), data.bpm(season, refresh=refresh))
     roster = data.rosters(season, refresh=refresh).groupby("TEAM_ID")["PLAYER_ID"].apply(set)
@@ -331,9 +366,48 @@ def cmd_predict(args, refresh: bool = False):
     print(preds[["away", "home", "away_pts", "home_pts", "home_margin", "total"]].to_string(index=False))
     print(f"Saved {path}. For a game's breakdown: python -m nbamodel explain --date {day.date()} --game <team>")
     if getattr(args, "push", False):
-        subprocess.run(["git", "add", str(config.PREDICTIONS_DIR)], cwd=config.ROOT, check=True)
-        subprocess.run(["git", "commit", "-m", f"Predictions for {day.date()}"], cwd=config.ROOT)
-        subprocess.run(["git", "push"], cwd=config.ROOT, check=True)
+        push_predictions(str(day.date()))
+
+
+def push_predictions(day: str) -> None:
+    """Commit the predictions folder to its own branch on config.PREDICTIONS_REMOTE and push it.
+
+    Uses a separate git index, so the checked-out branch and anything staged for it are
+    untouched, and the predictions never mix with the code's history."""
+    remote, branch = config.PREDICTIONS_REMOTE, config.PREDICTIONS_BRANCH
+
+    def git(*cmd, env=None, check=True):
+        return subprocess.run(["git", *cmd], cwd=config.ROOT, env=env, check=check,
+                              capture_output=True, text=True).stdout.strip()
+
+    # Exit code 2 means the remote is reachable but the branch doesn't exist yet (first push).
+    listed = subprocess.run(["git", "ls-remote", "--exit-code", "--heads", remote, branch],
+                            cwd=config.ROOT, capture_output=True, text=True)
+    if listed.returncode not in (0, 2):
+        print(f"Could not reach {remote} to push the predictions: {listed.stderr.strip()}")
+        return
+    parent = None
+    if listed.returncode == 0:
+        git("fetch", "-q", remote, branch)
+        parent = git("rev-parse", "FETCH_HEAD")
+    index = config.ROOT / git("rev-parse", "--git-path", "predictions-index")
+    env = {**os.environ, "GIT_INDEX_FILE": str(index)}
+    try:
+        git("read-tree", "--empty", env=env)
+        git("add", "-f", "--", config.PREDICTIONS_DIR.name, env=env)
+        tree = git("write-tree", env=env)
+    finally:
+        index.unlink(missing_ok=True)
+    if parent and git("rev-parse", f"{parent}^{{tree}}") == tree:
+        print(f"Predictions already on {remote}/{branch}.")
+        return
+    commit = git("commit-tree", tree, "-m", f"Predictions for {day}", *(["-p", parent] if parent else []))
+    pushed = subprocess.run(["git", "push", "-q", remote, f"{commit}:refs/heads/{branch}"],
+                            cwd=config.ROOT, capture_output=True, text=True)
+    if pushed.returncode:
+        print(f"Could not push the predictions to {remote}/{branch}: {pushed.stderr.strip()}")
+        return
+    print(f"Pushed predictions to {remote}/{branch}.")
 
 
 def main(argv=None):
@@ -364,7 +438,8 @@ def main(argv=None):
                            else "Refresh this season's data, then predict today")
         p.add_argument("--date", help="YYYY-MM-DD, default today")
         p.add_argument("--no-injury-report", action="store_true", help="Use only manual_status.csv")
-        p.add_argument("--push", action="store_true", help="Commit and push the predictions")
+        p.add_argument("--push", action="store_true",
+                       help="Push the predictions folder to its own branch (config.PREDICTIONS_REMOTE)")
         p.add_argument("--playoffs", choices=["include", "exclude", "relative"], help=playoff_help)
     args = parser.parse_args(argv)
     args.playoffs_default = config.PLAYOFF_GAMES

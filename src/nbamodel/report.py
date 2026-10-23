@@ -182,7 +182,7 @@ def model_vs_formula(bt: pd.DataFrame, out):
     lo, hi = bt["margin_mae"].min(), bt["margin_mae"].max()
     ax.set_ylim(lo - 0.15, hi + 0.15)
     _legend(ax, loc="upper left")
-    _headline(fig, "The regression beats the formula every season",
+    _headline(fig, "The regression beats the formula in every validation season",
               "Average miss on the final margin. Each season predicted by a model trained only on earlier seasons.")
     fig.subplots_adjust(left=0.11, right=0.97, top=0.8, bottom=0.1)
     return _save(fig, out)
