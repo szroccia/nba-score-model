@@ -116,6 +116,9 @@ def bpm(season: str, refresh: bool = False) -> pd.DataFrame:
             table = pd.read_html(io.StringIO(html), attrs={"id": "advanced"}, flavor="lxml")[0]
         except ValueError:  # page exists but no stats yet
             return pd.DataFrame(columns=["Player", "MP", "OBPM", "DBPM", "BPM"])
+        if not {"OBPM", "DBPM", "BPM"} <= set(table.columns):
+            # Early in a season the page lists players before Box Plus/Minus is published.
+            return pd.DataFrame(columns=["Player", "MP", "OBPM", "DBPM", "BPM"])
         table = table[table["Player"].notna() & (table["Player"] != "Player")]
         table = table[~table["Player"].str.contains("League Average", na=False)]
         for col in ["MP", "OBPM", "DBPM", "BPM"]:

@@ -2,24 +2,57 @@
 
 Predicts the final score of every NBA game, and updates through the day as injury and rest news comes in.
 
-The model is deliberately simple: a handful of predictors that carry most of the signal, combined with a ridge regression whose coefficients you can read.
+The model is deliberately simple and explainable: a handful of predictors that carry most of the signal, combined with a ridge regression whose coefficients you can read. Every major choice is written up with its evidence in the [decision log](docs/decisions.md).
 
-## How it works
+## Results
 
-Each team's points are predicted from four ideas:
+Validation seasons 2023-24 and 2024-25, 2,620 games. Each month is predicted by a model refit only on earlier games:
+
+| | Margin error (points) | Total error (points) | Winners picked |
+| --- | --- | --- | --- |
+| This model | 10.94 | 14.59 | 66.7% |
+| Vegas closing line | 10.62 | 14.15 | 68.7% |
+
+![Model vs Vegas by month](docs/figures/vegas_by_month.png)
+
+The 2025-26 season is held back as a locked test set; see [How it's evaluated](#how-its-evaluated).
+
+## How a prediction is built
+
+```mermaid
+flowchart LR
+    A[Box scores] --> B[Team pace and<br/>efficiency ratings]
+    B --> C[Pace x efficiency<br/>formula]
+    D[Injury report and<br/>current rosters] --> E[Tonight's lineup<br/>vs usual lineup]
+    F[Player Box Plus/Minus] --> E
+    G[Home court, rest,<br/>back-to-backs] --> H
+    C --> H[Ridge regression]
+    E --> H
+    H --> I[Home and away<br/>points]
+```
+
+Each team's points come from four ideas:
 
 1. **Pace.** How many possessions the game will have, from both teams' recent pace.
 2. **Efficiency.** The team's offensive rating (points per 100 possessions) against the opponent's defensive rating, weighted toward recent games.
 3. **Tonight's lineup.** Who is in and out. Each player's Box Plus/Minus is weighed against the minutes he is expected to play tonight compared with recent games, so a star sitting out lowers his team's offense and defense.
 4. **Context.** Home court, days of rest and back-to-backs.
 
-The core of the prediction is the possession formula:
+The core is the possession formula:
 
 ```
 base points = expected pace / 100 x (team ORtg + opponent DRtg - league ORtg)
 ```
 
-A ridge regression then learns how much weight to give the base points, the lineup changes, home court and rest. Each game gets a home score and an away score, so the margin and total come with it.
+The regression then adds the adjustments for lineups, home court and rest. `python -m nbamodel explain --game <team>` draws any game's prediction step by step:
+
+![How one prediction is built](docs/figures/example_prediction.png)
+
+## What the model learned
+
+![Model coefficients](docs/figures/coefficients.png)
+
+The formula is taken almost exactly at face value (about 0.98). Home court is worth about 2 points, and facing a team on the second night of a back-to-back about 1. The coefficients are saved in `data/model.json`, and every tunable setting (rating half-life, injury status probabilities, replacement-level BPM and so on) is in `src/nbamodel/config.py`.
 
 | Feature | Meaning |
 | --- | --- |
@@ -29,8 +62,6 @@ A ridge regression then learns how much weight to give the base points, the line
 | `IS_HOME` | Home team flag |
 | `REST`, `OPP_REST` | Days off before the game (capped at 3) |
 | `B2B`, `OPP_B2B` | Second night of a back-to-back |
-
-The trained coefficients are saved in `data/model.json`. Every tunable setting (rating half-life, injury status probabilities, replacement-level BPM and so on) is in `src/nbamodel/config.py`.
 
 ### Lineup changes
 
@@ -47,6 +78,29 @@ A missing player's minutes are handed to teammates in proportion to their usual 
 
 Each run also pulls every team's current roster. Players who have left a team are taken out of its lineup, and newcomers are added using their recent minutes and BPM from their old team. Early in a season, when team ratings still lean on last season's games, this is what accounts for offseason trades and signings. The effect fades on its own as the new roster plays games together. You can override any status by adding a row to `manual_status.csv`, which is handy for late scratches.
 
+## How it's evaluated
+
+![Evaluation scheme](docs/figures/evaluation_scheme.png)
+
+`python -m nbamodel evaluate` is the yardstick for every modeling change:
+
+- **Rolling-origin cross-validation.** For each month of the validation seasons, the regression is refit on every earlier game and predicts that month, which is how the live model runs. No fold trains on a later game.
+- **A locked test season.** 2025-26 is never used to choose anything. `evaluate --final` scores it with the current settings and appends the result, commit and settings to `results/test_log.md`, so every look at the test set is on record.
+- **A selection rule fixed in advance.** Margin error, then total error, then total bias nearest zero; near-ties go to the simpler model.
+- **Complexity and learning curves** for ridge strength and for how much history the model needs.
+- **Vegas benchmark.** Closing spreads and totals from ESPN's public API, compared game by game.
+
+Full tables are in [results/evaluation.md](results/evaluation.md). `python -m nbamodel backtest` gives a simpler season-by-season check in [results/backtest.md](results/backtest.md). In both, lineups use who actually played (historical injury reports are not kept) and player values use only the previous season's BPM, to avoid looking ahead.
+
+## Key decisions
+
+Each is explained with its evidence in the [decision log](docs/decisions.md):
+
+- [Ratings + ridge regression](docs/decisions.md#1-model-approach) over the plain formula or a black-box model
+- [Official data sources](docs/decisions.md#2-data-sources) and [Box Plus/Minus](docs/decisions.md#3-player-value) for player value
+- [Rolling monthly evaluation with a locked test season](docs/decisions.md#5-evaluation-design)
+- [Playoff games kept in ratings](docs/decisions.md#6-playoff-games-in-ratings) and [ridge alpha 10](docs/decisions.md#7-ridge-strength)
+
 ## Data
 
 | Data | Source |
@@ -54,6 +108,7 @@ Each run also pulls every team's current roster. Players who have left a team ar
 | Box scores, schedule | stats.nba.com through [nba_api](https://github.com/swar/nba_api) |
 | Box Plus/Minus | [Basketball-Reference](https://www.basketball-reference.com) season advanced stats (one page per season) |
 | Injuries and rest | Official NBA injury report PDFs |
+| Vegas closing lines (benchmark only) | ESPN's public odds archive |
 
 stats.nba.com blocks most cloud servers, so the data steps are meant to run from a home internet connection. `python -m nbamodel injuries` shows exactly which players the injury report reader found, to compare with the PDF.
 
@@ -72,15 +127,13 @@ pip install -e ".[dev]"
 python -m nbamodel fetch         # download six seasons of data (about 10 minutes)
 python -m nbamodel train         # fit the model, writes data/model.json
 python -m nbamodel backtest      # accuracy by season, writes results/backtest.md
-python -m nbamodel report        # chart of the backtest, writes results/backtest.png
+python -m nbamodel evaluate      # cross-validation, tuning curves, Vegas benchmark (results/evaluation.md)
+python -m nbamodel report        # redraw the charts in docs/figures
 python -m nbamodel predict       # today's games
+python -m nbamodel explain --game BOS   # chart of how one game's prediction is built
 ```
 
 `predict` accepts `--date YYYY-MM-DD` and `--no-injury-report` (use only `manual_status.csv`).
-
-### Playoff games in ratings
-
-Playoff games are slower and lower scoring than the regular season, which matters most early in a season, when ratings still lean on last season's final games. `PLAYOFF_GAMES` in `config.py` chooses how they're used: `include` (as is), `exclude`, or `relative` (counted, but measured against the playoff league average). `python -m nbamodel backtest --playoffs all` compares all three, including a row for each season's first 15 games, in `results/playoff_comparison.md`.
 
 ## Daily updates
 
@@ -108,21 +161,15 @@ When a later run changes a prediction by a point or more, the change and the pla
 | `home_lineup_pts`, `away_lineup_pts` | How much tonight's lineups moved that team's margin |
 | `home_missing`, `away_missing` | Rotation players with less than a 100% chance of playing |
 
-## Backtest
-
-`python -m nbamodel backtest` predicts each season with a model trained only on earlier seasons, and compares it with the plain possession formula. Results are written to [results/backtest.md](results/backtest.md). `python -m nbamodel report` turns them and the model's coefficients into a chart:
-
-![Backtest accuracy and model coefficients](results/backtest.png)
-
-In the backtest, lineups use who actually played in each game, because historical injury reports are not kept in the data. Player values use only the previous season's BPM to avoid looking ahead.
+`predictions/<date>_details.csv` has one row per team with every input and the points each step adds, which is what `explain` draws.
 
 ## Limitations and ideas
 
 - Ratings are not adjusted for strength of schedule yet.
+- The model is limited by its inputs rather than by data (see the [learning curve](docs/decisions.md#7-ridge-strength)), so richer features are the next step.
 - Minutes for absent players are redistributed in proportion to usual minutes, not by position.
 - Rookies have no NBA minutes or BPM, so they count only once they start playing.
 - Box Plus/Minus misses defense that doesn't show up in the box score.
-- Comparing against Vegas closing lines would give a stronger benchmark.
 
 ## Tests
 

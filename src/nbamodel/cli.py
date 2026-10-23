@@ -3,7 +3,9 @@
     python -m nbamodel fetch            # download data (run from a home connection)
     python -m nbamodel train            # fit the regression on past seasons
     python -m nbamodel backtest         # season-by-season accuracy check
-    python -m nbamodel report           # chart of the backtest and coefficients
+    python -m nbamodel report           # redraw the charts in docs/figures
+    python -m nbamodel explain --game BOS   # how one game's prediction is built
+    python -m nbamodel evaluate         # cross-validation, tuning curves and Vegas benchmark
     python -m nbamodel injuries         # check what the injury report reader finds
     python -m nbamodel predict          # today's games with the latest injury report
     python -m nbamodel daily            # refresh this season's data, then predict
@@ -16,7 +18,7 @@ from datetime import date as date_cls
 
 import pandas as pd
 
-from . import config, data, features, injuries, lineup, model, ratings, report
+from . import config, data, evaluate, features, injuries, lineup, model, ratings, report, vegas
 from .names import normalize_name
 
 
@@ -48,6 +50,8 @@ def cmd_fetch(args):
         data.bpm(season, refresh=True)
     data.schedule(current, refresh=True)
     data.rosters(current, refresh=True)
+    for season in _evaluation_seasons():
+        vegas.lines(season)  # past seasons don't change, so these download once
     print(f"Saved to {config.DATA_DIR}")
 
 
@@ -112,6 +116,7 @@ def cmd_backtest(args):
         for mode in ("include", "exclude", "relative"):
             config.PLAYOFF_GAMES = mode
             lines += _backtest_rows(f", playoffs {mode}")
+        config.PLAYOFF_GAMES = args.playoffs_default
         out = config.ROOT / "results" / "playoff_comparison.md"
     else:
         lines = ["# Backtest", "", *intro, f"Playoff games in ratings: {config.PLAYOFF_GAMES}.", ""] + TABLE_HEADER
@@ -122,8 +127,68 @@ def cmd_backtest(args):
     print("\n".join(lines))
 
 
+def _evaluation_seasons() -> list[str]:
+    return sorted(set(config.VALIDATION_SEASONS) | {config.TEST_SEASON})
+
+
+def _vegas_lines() -> pd.DataFrame | None:
+    try:
+        return pd.concat([vegas.lines(s) for s in _evaluation_seasons()], ignore_index=True)
+    except Exception as e:  # the benchmark is optional; the rest of the evaluation still runs
+        print(f"Could not load Vegas lines ({e}); skipping the benchmark.")
+        return None
+
+
+def cmd_evaluate(args):
+    seasons = sorted(set(config.TRAIN_SEASONS) | set(_evaluation_seasons()))
+    lines_ = _vegas_lines()
+    abbr = vegas.team_abbreviations()
+    if args.final:
+        print(f"Scoring the locked test season {config.TEST_SEASON}. Every run is logged in results/test_log.md;")
+        print("run this once per finished change, never to choose between settings.")
+        entry = evaluate.final(_historical(seasons), lines_, abbr)
+        print("\n".join(entry))
+        return
+    extra = None
+    if args.playoffs == "all":
+        extra = ["## Playoff games in ratings", "",
+                 "Same folds for each setting. October rows are the first month of each season, "
+                 "when ratings lean most on last season's games.", "",
+                 "| Setting | Games | Margin MAE | Total MAE | Winner % | Total bias | October total bias |",
+                 "| --- | --- | --- | --- | --- | --- | --- |"]
+        for mode in ("include", "exclude", "relative"):
+            config.PLAYOFF_GAMES = mode
+            feats = evaluate.validation_rows(_historical(seasons))
+            preds, _ = evaluate.cross_validate(feats, config.VALIDATION_SEASONS)
+            m = evaluate.metrics(preds)
+            october = evaluate.metrics(preds[preds["FOLD"].str.endswith("-10")])
+            extra.append(evaluate._row(f"playoffs {mode}", m, f"{october['total_bias']:+.2f}"))
+        config.PLAYOFF_GAMES = args.playoffs_default
+    print("\n".join(evaluate.run(_historical(seasons), lines_, abbr, extra)))
+    print("Saved results/evaluation.md")
+    cmd_report(args)
+
+
 def cmd_report(args):
-    print(f"Saved {report.run()}")
+    for path in report.run():
+        print(f"Saved {path.relative_to(config.ROOT)}")
+
+
+def cmd_explain(args):
+    """Chart of how one game's prediction is built, from the details `predict` saved."""
+    day = args.date or date_cls.today().isoformat()
+    path = config.PREDICTIONS_DIR / f"{day}_details.csv"
+    if not path.exists():
+        raise SystemExit(f"No {path.name}. Run `python -m nbamodel predict --date {day}` first.")
+    details = pd.read_csv(path)
+    team = args.game.upper()
+    game_ids = details.loc[details["team"] == team, "game_id"]
+    if game_ids.empty:
+        raise SystemExit(f"{team} has no game on {day}. Teams playing: {', '.join(sorted(details['team']))}")
+    game = details[details["game_id"] == game_ids.iloc[0]]
+    away, home = game.sort_values("IS_HOME")["team"]
+    out = config.ROOT / args.out if args.out else config.PREDICTIONS_DIR / f"{day}_{away}-at-{home}.png"
+    print(f"Saved {report.prediction_breakdown(game, out)}")
 
 
 def _warn_unmatched(statuses: pd.DataFrame, players: pd.DataFrame, teams: set) -> None:
@@ -163,7 +228,10 @@ def cmd_injuries(args):
     print(parsed.head(25).to_string(index=False))
 
 
-def predict_date(day: pd.Timestamp, use_injury_report: bool = True, refresh: bool = False) -> pd.DataFrame:
+def predict_date(day: pd.Timestamp, use_injury_report: bool = True, refresh: bool = False,
+                 details: list | None = None) -> pd.DataFrame:
+    """One row per game. If a list is passed as details, one row per team is appended to it
+    with the inputs and the points each step of the prediction adds."""
     season = data.season_for_date(day)
     prev = data.previous_season(season)
     games, players = _load([prev, season], refresh_season=season if refresh else None)
@@ -202,6 +270,13 @@ def predict_date(day: pd.Timestamp, use_injury_report: bool = True, refresh: boo
                                      roster.get(g.HOME_TEAM_ID) or None, roster.get(g.AWAY_TEAM_ID) or None)
         X = pd.DataFrame(pair)
         home_pts, away_pts = model.predict(fitted, X)
+        if details is not None:
+            for row, team, opp, pts in ((pair[0], g.HOME_TEAM, g.AWAY_TEAM, home_pts),
+                                        (pair[1], g.AWAY_TEAM, g.HOME_TEAM, away_pts)):
+                details.append({"date": day.date().isoformat(), "game_id": g.GAME_ID, "team": team,
+                                "opponent": opp, **{f: row[f] for f in features.FEATURES},
+                                **model.contributions(fitted, row), "predicted_pts": pts,
+                                "missing": row["MISSING"]})
         rows.append({
             "date": day.date().isoformat(),
             "game_id": g.GAME_ID,
@@ -239,7 +314,8 @@ def _log_changes(old: pd.DataFrame, new: pd.DataFrame, day: str) -> None:
 
 def cmd_predict(args, refresh: bool = False):
     day = pd.Timestamp(args.date or date_cls.today().isoformat())
-    preds = predict_date(day, use_injury_report=not args.no_injury_report, refresh=refresh)
+    details = []
+    preds = predict_date(day, use_injury_report=not args.no_injury_report, refresh=refresh, details=details)
     if preds.empty:
         return
     config.PREDICTIONS_DIR.mkdir(exist_ok=True)
@@ -248,11 +324,12 @@ def cmd_predict(args, refresh: bool = False):
         _log_changes(pd.read_csv(path), preds, str(day.date()))
     try:
         preds.to_csv(path, index=False)
+        pd.DataFrame(details).round(3).to_csv(config.PREDICTIONS_DIR / f"{day.date()}_details.csv", index=False)
     except PermissionError:
         print(f"Could not save {path}: it is probably open in Excel. Close it and run again.")
         return
     print(preds[["away", "home", "away_pts", "home_pts", "home_margin", "total"]].to_string(index=False))
-    print(f"Saved {path}")
+    print(f"Saved {path}. For a game's breakdown: python -m nbamodel explain --date {day.date()} --game <team>")
     if getattr(args, "push", False):
         subprocess.run(["git", "add", str(config.PREDICTIONS_DIR)], cwd=config.ROOT, check=True)
         subprocess.run(["git", "commit", "-m", f"Predictions for {day.date()}"], cwd=config.ROOT)
@@ -269,9 +346,19 @@ def main(argv=None):
     p_back = sub.add_parser("backtest", help="Season-by-season accuracy, written to results/backtest.md")
     p_back.add_argument("--playoffs", choices=["include", "exclude", "relative", "all"],
                         help=playoff_help + "; 'all' compares the three in results/playoff_comparison.md")
+    p_eval = sub.add_parser("evaluate", help="Cross-validation, tuning curves and Vegas benchmark, "
+                            "written to results/evaluation.md")
+    p_eval.add_argument("--final", action="store_true",
+                        help="Score the locked test season once and log it in results/test_log.md")
+    p_eval.add_argument("--playoffs", choices=["include", "exclude", "relative", "all"],
+                        help=playoff_help + "; 'all' adds a comparison of the three")
     inj = sub.add_parser("injuries", help="Show what the injury report reader finds")
     inj.add_argument("--file", help="Read a downloaded injury report PDF instead of fetching the latest")
-    sub.add_parser("report", help="Chart of backtest accuracy and coefficients, written to results/backtest.png")
+    sub.add_parser("report", help="Redraw the charts in docs/figures from results/ and data/model.json")
+    p_explain = sub.add_parser("explain", help="Chart of how one game's prediction is built")
+    p_explain.add_argument("--game", required=True, help="Either team's abbreviation, e.g. BOS")
+    p_explain.add_argument("--date", help="YYYY-MM-DD, default today")
+    p_explain.add_argument("--out", help="Where to save the chart, default predictions/<date>_<away>-at-<home>.png")
     for name in ("predict", "daily"):
         p = sub.add_parser(name, help="Predict a day's games" if name == "predict"
                            else "Refresh this season's data, then predict today")
@@ -280,6 +367,7 @@ def main(argv=None):
         p.add_argument("--push", action="store_true", help="Commit and push the predictions")
         p.add_argument("--playoffs", choices=["include", "exclude", "relative"], help=playoff_help)
     args = parser.parse_args(argv)
+    args.playoffs_default = config.PLAYOFF_GAMES
     if getattr(args, "playoffs", None) and args.playoffs != "all":
         config.PLAYOFF_GAMES = args.playoffs
     if args.command == "fetch":
@@ -288,10 +376,14 @@ def main(argv=None):
         cmd_train(args)
     elif args.command == "backtest":
         cmd_backtest(args)
+    elif args.command == "evaluate":
+        cmd_evaluate(args)
     elif args.command == "injuries":
         cmd_injuries(args)
     elif args.command == "report":
         cmd_report(args)
+    elif args.command == "explain":
+        cmd_explain(args)
     elif args.command == "predict":
         cmd_predict(args)
     elif args.command == "daily":

@@ -159,8 +159,18 @@ def test_report_chart_from_backtest_table(tmp_path):
     bt = report.read_backtest(md)
     assert bt.loc[0, "margin_mae"] == 10.92 and bt.loc[1, "winner_pct"] == 66.5
     fitted = {"coefficients": {k: 0.5 for k in features.FEATURES}, "seasons": ["2023-24"]}
-    out = report.make_chart(bt, fitted, tmp_path / "chart.png")
-    assert out.stat().st_size > 10_000
+    assert report.coefficients(fitted, tmp_path / "coef.png").stat().st_size > 10_000
+    assert report.model_vs_formula(bt, tmp_path / "formula.png").stat().st_size > 10_000
+
+
+def test_contributions_add_up_to_the_prediction():
+    fitted = {"intercept": 1.5, "coefficients": dict(zip(features.FEATURES, [0.98, 0.6, 1.2, 2.1, 0.1, -0.1, -0.8, 1.2]))}
+    row = {"BASE_PTS": 113.0, "LINEUP_OFF_PTS": -2.0, "LINEUP_DEF_PTS": 1.0, "IS_HOME": 1,
+           "REST": 2, "OPP_REST": 0, "B2B": 0, "OPP_B2B": 1}
+    parts = model.contributions(fitted, row)
+    assert list(parts) == model.STEPS
+    assert sum(parts.values()) == pytest.approx(model.predict(fitted, pd.DataFrame([row]))[0])
+    assert parts["Home court"] == pytest.approx(2.1)
 
 
 def test_healthy_team_with_deep_bench_has_no_lineup_change():
@@ -249,3 +259,150 @@ def test_backtest_comparison_runs(monkeypatch, tmp_path):
     table = (tmp_path / "results" / "playoff_comparison.md").read_text()
     assert "Ridge (B), first 15 games, playoffs relative" in table
     assert table.count("| 2025-26 |") == 9
+
+
+def _fake_features(seasons=("2022-23", "2023-24", "2024-25", "2025-26"), n_teams=6, seed=1):
+    """Feature rows like historical_features makes, where points = BASE_PTS + home edge + noise."""
+    rng = np.random.default_rng(seed)
+    rows, gid = [], 0
+    for season in seasons:
+        start = pd.Timestamp(f"{season[:4]}-10-22")
+        for day in range(170):
+            date = start + pd.Timedelta(days=day)
+            teams = rng.permutation(n_teams)
+            for h, a in zip(teams[::2], teams[1::2]):
+                gid += 1
+                for team, opp, home in ((h, a, 1), (a, h, 0)):
+                    base = 112 + rng.normal(0, 4)
+                    rows.append({"GAME_ID": gid, "GAME_DATE": date, "SEASON": season, "TEAM_ID": int(team) + 1,
+                                 "OPP_TEAM_ID": int(opp) + 1, "GAMES_PLAYED": 50, "SEASON_GAMES": day,
+                                 "BASE_PTS": base, "LINEUP_OFF_PTS": rng.normal(0, 1), "LINEUP_DEF_PTS": 0.0,
+                                 "IS_HOME": home, "REST": 1, "OPP_REST": 1, "B2B": 0, "OPP_B2B": 0,
+                                 "PTS": round(base + (1.5 if home else -1.5) + rng.normal(0, 9))})
+    return pd.DataFrame(rows)
+
+
+def test_folds_only_train_on_the_past_and_skip_the_test_season(monkeypatch):
+    from nbamodel import config, evaluate
+
+    monkeypatch.setattr(config, "TEST_SEASON", "2025-26")
+    feats = evaluate.validation_rows(_fake_features())
+    assert "2025-26" not in set(feats["SEASON"])
+    folds = list(evaluate.monthly_folds(feats, ["2023-24", "2024-25"]))
+    assert len(folds) == 14  # October through April, two seasons
+    for _, _, train, test in folds:
+        assert train["GAME_DATE"].max() < test["GAME_DATE"].min()
+        assert test["GAME_DATE"].dt.to_period("M").nunique() == 1
+
+
+def test_vegas_line_parsing():
+    from nbamodel import vegas
+
+    assert vegas.home_line("NY -5.5", "PHI") == -5.5
+    assert vegas.home_line("PHI -3", "PHI") == 3.0
+    assert vegas.home_line("EVEN", "PHI") == 0.0
+    items = [
+        {"provider": {"name": "Caesars Sportsbook (New Jersey) - Live Odds"}, "details": "PHI -9", "overUnder": 250},
+        {"provider": {"name": "DraftKings"}, "details": "NY -6", "overUnder": 220},
+        {"provider": {"name": "consensus"}, "details": "NY -5.5", "overUnder": 219.5},
+    ]
+    assert vegas.pick_line(items, "PHI") == {"VEGAS_HOME_MARGIN": -5.5, "VEGAS_TOTAL": 219.5, "BOOK": "consensus"}
+    assert vegas.pick_line(items[:1], "PHI") is None
+    assert vegas.nba_abbreviation("GS") == "GSW" and vegas.nba_abbreviation("BOS") == "BOS"
+
+
+def test_rank_prefers_simpler_model_on_a_tie():
+    from nbamodel import evaluate
+
+    table = pd.DataFrame({"alpha": [1, 100, 10], "margin_mae": [11.001, 11.004, 11.2],
+                          "total_mae": [15, 15, 14], "abs_total_bias": [0.1, 0.1, 0.0]})
+    assert evaluate.rank(table)["alpha"].tolist() == [100, 1, 10]
+
+
+def test_evaluation_report_and_locked_test_log(monkeypatch, tmp_path):
+    from nbamodel import config, evaluate, report
+
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "VALIDATION_SEASONS", ["2023-24", "2024-25"])
+    monkeypatch.setattr(config, "TEST_SEASON", "2025-26")
+    monkeypatch.setattr(config, "ALPHA_GRID", [0.1, 10, 1000])
+    monkeypatch.setattr(config, "LEARNING_CURVE_SIZES", [50, 200, 800])
+    feats = _fake_features()
+    abbr = {i: f"T{i}" for i in range(1, 7)}
+    # Vegas lines: the true expected margin and total, so Vegas should beat a fitted model slightly.
+    games = evaluate.game_frame(feats, feats["BASE_PTS"] + 1.5 * (2 * feats["IS_HOME"] - 1), abbr)
+    lines = games.rename(columns={"PRED_MARGIN": "VEGAS_HOME_MARGIN", "PRED_TOTAL": "VEGAS_TOTAL"})
+
+    text = "\n".join(evaluate.run(feats, lines, abbr))
+    assert "## Against the Vegas closing line" in text and "## Learning curve" in text
+    assert "| 2025-1" not in text and "| 2026-" not in text  # no test-season months
+    tables = report.read_tables(tmp_path / "results" / "evaluation.md")
+    assert {"Current settings", "Against the Vegas closing line", "Learning curve"} <= set(tables)
+    assert tables["Complexity curve (ridge alpha)"]["Alpha"].tolist() == [0.1, 10, 1000]
+    monkeypatch.setattr(config, "MODEL_PATH", tmp_path / "missing.json")
+    made = {p.name for p in report.run(tmp_path / "figures")}
+    assert made == {"evaluation_scheme.png", "vegas_by_month.png", "ridge_alpha.png", "learning_curve.png"}
+    curve = evaluate.complexity_curve(evaluate.validation_rows(feats), ["2024-25"], [0.1, 1e6])
+    assert curve.loc[0, "margin_mae"] < curve.loc[1, "margin_mae"]  # crushing the coefficients hurts
+
+    evaluate.final(feats, lines, abbr)
+    evaluate.final(feats, lines, abbr)
+    log = (tmp_path / "results" / "test_log.md").read_text()
+    assert log.count("# Test season log") == 1 and log.count("## ") == 2
+    assert "Vegas closing line" in log
+
+
+def test_evaluate_command_compares_playoff_settings(monkeypatch, tmp_path):
+    from nbamodel import cli, config
+
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "PLAYOFF_GAMES", "include")
+    monkeypatch.setattr(config, "VALIDATION_SEASONS", ["2023-24", "2024-25"])
+    monkeypatch.setattr(config, "TEST_SEASON", "2025-26")
+    monkeypatch.setattr(config, "ALPHA_GRID", [1, 100])
+    monkeypatch.setattr(config, "LEARNING_CURVE_SIZES", [100, 400])
+    monkeypatch.setattr(config, "MODEL_PATH", tmp_path / "missing.json")
+    feats = _fake_features()
+    monkeypatch.setattr(cli, "_historical", lambda seasons: feats)
+    monkeypatch.setattr(cli, "_vegas_lines", lambda: None)
+    cli.main(["evaluate", "--playoffs", "all"])
+    assert (tmp_path / "docs" / "figures" / "playoff_settings.png").exists()
+    report = (tmp_path / "results" / "evaluation.md").read_text()
+    assert report.count("| playoffs ") == 3
+    assert config.PLAYOFF_GAMES == "include"  # restored after the comparison
+
+
+def test_explain_draws_one_game(monkeypatch, tmp_path):
+    from nbamodel import cli, config
+
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "PREDICTIONS_DIR", tmp_path / "predictions")
+    fitted = {"intercept": 0.2, "coefficients": dict(zip(features.FEATURES, [0.99, 0.6, 1.2, 2.1, 0.1, 0, -0.8, 1.2]))}
+    rows = []
+    for team, opp, home in (("BOS", "DET", 0), ("DET", "BOS", 1)):
+        x = {"BASE_PTS": 112.0, "LINEUP_OFF_PTS": -1.0, "LINEUP_DEF_PTS": 0.5, "IS_HOME": home,
+             "REST": 1, "OPP_REST": 1, "B2B": 0, "OPP_B2B": 0}
+        rows.append({"date": "2026-10-22", "game_id": 7, "team": team, "opponent": opp, **x,
+                     **model.contributions(fitted, x), "predicted_pts": model.predict(fitted, pd.DataFrame([x]))[0],
+                     "missing": "Jayson Tatum (0%)" if team == "BOS" else ""})
+    (tmp_path / "predictions").mkdir()
+    pd.DataFrame(rows).to_csv(tmp_path / "predictions" / "2026-10-22_details.csv", index=False)
+    cli.main(["explain", "--date", "2026-10-22", "--game", "det"])
+    assert (tmp_path / "predictions" / "2026-10-22_BOS-at-DET.png").stat().st_size > 10_000
+    with pytest.raises(SystemExit):
+        cli.main(["explain", "--date", "2026-10-22", "--game", "LAL"])
+
+
+def test_bpm_before_it_is_published(monkeypatch, tmp_path):
+    """Early in a season Basketball-Reference lists players without BPM columns."""
+    import io
+
+    from nbamodel import config, data
+
+    html = ("<table id='advanced'><thead><tr><th>Rk</th><th>Player</th><th>MP</th><th>PER</th></tr></thead>"
+            "<tbody><tr><td>1</td><td>Paolo Banchero</td><td>41</td><td>29.5</td></tr></tbody></table>")
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(data.urllib.request, "urlopen", lambda *a, **k: io.BytesIO(html.encode()))
+    df = data.bpm("2026-27", refresh=True)
+    assert df.empty and list(df.columns) == ["Player", "MP", "OBPM", "DBPM", "BPM"]
+    assert lineup.player_impact(data.bpm("2025-26", refresh=True), df).empty

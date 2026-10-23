@@ -13,12 +13,14 @@ from .features import FEATURES
 MIN_GAMES_FOR_TRAINING = 10
 
 
-def fit(train: pd.DataFrame) -> dict:
+def fit(train: pd.DataFrame, alpha: float | None = None) -> dict:
     rows = train[train["GAMES_PLAYED"] >= MIN_GAMES_FOR_TRAINING]
-    ridge = Ridge(alpha=config.RIDGE_ALPHA).fit(rows[FEATURES], rows["PTS"])
+    alpha = config.RIDGE_ALPHA if alpha is None else alpha
+    ridge = Ridge(alpha=alpha).fit(rows[FEATURES], rows["PTS"])
     return {
         "intercept": float(ridge.intercept_),
         "coefficients": dict(zip(FEATURES, map(float, ridge.coef_))),
+        "alpha": alpha,
         "trained_on_rows": int(len(rows)),
         "seasons": sorted(rows["SEASON"].unique().tolist()),
     }
@@ -27,6 +29,27 @@ def fit(train: pd.DataFrame) -> dict:
 def predict(model: dict, X: pd.DataFrame) -> np.ndarray:
     coef = np.array([model["coefficients"][f] for f in FEATURES])
     return model["intercept"] + X[FEATURES].to_numpy() @ coef
+
+
+# A prediction broken into the steps that add up to it, in plain words, in order.
+STEPS = ["Pace x efficiency formula", "Regression calibration", "Own lineup tonight",
+         "Opponent's lineup tonight", "Home court", "Rest and back-to-backs"]
+
+
+def contributions(model: dict, row: dict) -> dict:
+    """Points each step adds for one team. The steps sum to that team's predicted points.
+
+    The formula enters at face value; "regression calibration" is the intercept plus the
+    small correction from its coefficient not being exactly 1."""
+    c = model["coefficients"]
+    return {
+        STEPS[0]: row["BASE_PTS"],
+        STEPS[1]: model["intercept"] + (c["BASE_PTS"] - 1) * row["BASE_PTS"],
+        STEPS[2]: c["LINEUP_OFF_PTS"] * row["LINEUP_OFF_PTS"],
+        STEPS[3]: c["LINEUP_DEF_PTS"] * row["LINEUP_DEF_PTS"],
+        STEPS[4]: c["IS_HOME"] * row["IS_HOME"],
+        STEPS[5]: sum(c[f] * row[f] for f in ("REST", "OPP_REST", "B2B", "OPP_B2B")),
+    }
 
 
 def save(model: dict, path=config.MODEL_PATH) -> None:

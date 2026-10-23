@@ -47,5 +47,18 @@ FEATURE_VERSION = 4
 # Rest days are capped: 3+ days off is treated the same as 3.
 MAX_REST_DAYS = 3
 
-# Ridge regression strength.
-RIDGE_ALPHA = 1.0
+# Ridge regression strength. Every alpha from 0.01 to 100 scored the same on validation
+# (results/evaluation.md); the selection rule breaks ties toward the simpler model, which is 10.
+RIDGE_ALPHA = 10.0
+
+# Evaluation (python -m nbamodel evaluate). Settings are compared on the validation seasons
+# only, refitting before each month and predicting that month. The test season stays locked:
+# it is scored only by `evaluate --final`, and every such run is logged in results/test_log.md.
+VALIDATION_SEASONS = ["2023-24", "2024-25"]
+TEST_SEASON = "2025-26"
+# Fixed before looking at results: settings are ranked by margin MAE, then total MAE,
+# then how far the average total sits from the actual (closest to zero wins).
+SELECTION_METRICS = ["margin_mae", "total_mae", "abs_total_bias"]
+# Ridge strengths tried for the complexity curve, and training sizes (team-games) for the learning curve.
+ALPHA_GRID = [0.01, 0.1, 1, 10, 100, 1000, 10000, 100000]
+LEARNING_CURVE_SIZES = [100, 250, 500, 1000, 2000, 4000]
