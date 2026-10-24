@@ -83,6 +83,43 @@ def cross_validate(feats: pd.DataFrame, seasons: list[str], alpha: float | None 
     return pd.concat(preds, ignore_index=True), pd.DataFrame(train_scores)
 
 
+def paired_change(base: pd.DataFrame, other: pd.DataFrame, target: str) -> tuple[float, float]:
+    """Average change in absolute error from base to other on the same games ("MARGIN" or
+    "TOTAL"), and its standard error.
+
+    Pairing by game cancels the noise both versions share (a 30-point blowout misleads both).
+    The standard error treats each month (fold) as one block, because games in the same month
+    share conditions; counting every game as independent would make small changes look surer
+    than they are."""
+    both = base.merge(other, on="GAME_ID", suffixes=("_base", "_other"))
+    change = ((both[f"{target}_other"] - both[f"PRED_{target}_other"]).abs()
+              - (both[f"{target}_base"] - both[f"PRED_{target}_base"]).abs())
+    mean = float(change.mean())
+    blocks = change.groupby(both["FOLD_base"]).agg(["sum", "size"])
+    resid = blocks["sum"] - blocks["size"] * mean
+    k = len(blocks)
+    se = float(np.sqrt(k / (k - 1) * (resid ** 2).sum()) / len(change)) if k > 1 else float("inf")
+    return mean, se
+
+
+def noise_test(base: pd.DataFrame, other: pd.DataFrame) -> dict:
+    """The rule fixed in advance for on/off decisions (docs/decisions.md, decision 8).
+
+    other is "better" only if it lowers margin error by more than NOISE_STANDARD_ERRORS
+    standard errors, or is within the noise on margin and lowers total error by that much;
+    "worse" the same way in the other direction; otherwise a "tie", which goes to the simpler
+    model."""
+    k = config.NOISE_STANDARD_ERRORS
+    out = {t: paired_change(base, other, t.upper()) for t in ("margin", "total")}
+    out["verdict"] = "tie"
+    for target in ("margin", "total"):
+        change, se = out[target]
+        if abs(change) > k * se:
+            out["verdict"] = "better" if change < 0 else "worse"
+            break
+    return out
+
+
 def validation_rows(feats: pd.DataFrame) -> pd.DataFrame:
     """Everything except the locked test season (and anything after it)."""
     start = feats.loc[feats["SEASON"] == config.TEST_SEASON, "GAME_DATE"].min()

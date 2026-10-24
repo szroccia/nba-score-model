@@ -1,11 +1,13 @@
 """Command line: fetch data, train, backtest and predict.
 
     python -m nbamodel fetch            # download data (run from a home connection)
+    python -m nbamodel validate         # sanity checks on the downloaded data
     python -m nbamodel train            # fit the regression on past seasons
     python -m nbamodel backtest         # season-by-season accuracy check
     python -m nbamodel report           # redraw the charts in docs/figures
     python -m nbamodel explain --game BOS   # how one game's prediction is built
     python -m nbamodel evaluate         # cross-validation, tuning curves and Vegas benchmark
+    python -m nbamodel evaluate --compare all   # plus with/without tables for each setting decision
     python -m nbamodel injuries         # check what the injury report reader finds
     python -m nbamodel predict          # today's games with the latest injury report
     python -m nbamodel daily            # refresh this season's data, then predict
@@ -20,7 +22,7 @@ from datetime import date as date_cls
 
 import pandas as pd
 
-from . import config, data, evaluate, features, injuries, lineup, model, ratings, report, vegas
+from . import config, data, evaluate, features, injuries, lineup, model, ratings, report, validate, vegas
 from .names import normalize_name
 
 
@@ -37,6 +39,8 @@ def _load(seasons: list[str], refresh_season: str | None = None):
         [ratings.team_game_table(data.team_games(s, refresh=(s == refresh_season))) for s in seasons],
         ignore_index=True,
     )
+    if config.OPPONENT_ADJUST:  # across all seasons at once, so October opponents have a history
+        games = ratings.opponent_adjust(games)
     players = pd.concat(
         [data.player_games(s, refresh=(s == refresh_season)) for s in seasons], ignore_index=True
     )
@@ -71,6 +75,12 @@ def _historical(seasons: list[str]) -> pd.DataFrame:
     feats = features.historical_features(games, players, impact, seasons)
     feats.to_csv(path, index=False)
     return feats
+
+
+def cmd_validate(args):
+    current = data.season_for_date(pd.Timestamp.today())
+    ok = validate.run(_all_seasons(current), current)
+    print("\nAll checks passed." if ok else "\nSome checks need a look (WARN above).")
 
 
 def cmd_train(args):
@@ -145,6 +155,52 @@ def _vegas_lines() -> pd.DataFrame | None:
         return None
 
 
+# Settings `evaluate --compare` puts side by side: config name, (value, label) pairs, heading.
+# The first value listed is the simpler one.
+COMPARISONS = {
+    "playoffs": ("PLAYOFF_GAMES", [("include", "playoffs include"), ("exclude", "playoffs exclude"),
+                                   ("relative", "playoffs relative")], "Playoff games in ratings"),
+    "sos": ("OPPONENT_ADJUST", [(False, "off"), (True, "on")], "Strength of schedule"),
+}
+
+
+def _comparison(name: str, seasons: list[str]) -> list[str]:
+    """A table of one setting's values on the same validation folds, each checked against the
+    current value with the noise test fixed in advance (evaluate.noise_test)."""
+    attr, options, heading = COMPARISONS[name]
+    current = getattr(config, attr)
+    preds = {}
+    try:
+        for value, _ in options:
+            setattr(config, attr, value)
+            preds[value], _ = evaluate.cross_validate(evaluate.validation_rows(_historical(seasons)),
+                                                      config.VALIDATION_SEASONS)
+    finally:
+        setattr(config, attr, current)
+    k = config.NOISE_STANDARD_ERRORS
+    label = dict(options)[current]
+    lines = [f"## {heading}", "",
+             f"Same folds for each setting. Changes are in average error against the current setting "
+             f"({label}) on the same games; noise is {k} standard errors, measured month to month. "
+             "A change within the noise is a tie, and a tie keeps the simpler setting. October is the "
+             "first month of each season, when ratings lean most on last season's games.", "",
+             "| Setting | Games | Margin MAE | Total MAE | Winner % | Total bias | October total bias "
+             "| Margin change | Margin noise | Total change | Total noise | Verdict |",
+             "|" + " --- |" * 12]
+    for value, name_ in options:
+        m = evaluate.metrics(preds[value])
+        october = evaluate.metrics(preds[value][preds[value]["FOLD"].str.endswith("-10")])
+        if value == current:
+            test = ["-", "-", "-", "-", "current"]
+        else:
+            t = evaluate.noise_test(preds[current], preds[value])
+            # Three decimals: changes this small round to the same two-decimal number as the noise.
+            test = [f"{t['margin'][0]:+.3f}", f"{k * t['margin'][1]:.3f}",
+                    f"{t['total'][0]:+.3f}", f"{k * t['total'][1]:.3f}", t["verdict"]]
+        lines.append(evaluate._row(name_, m, f"{october['total_bias']:+.2f}", *test))
+    return lines
+
+
 def cmd_evaluate(args):
     seasons = sorted(set(config.TRAIN_SEASONS) | set(_evaluation_seasons()))
     lines_ = _vegas_lines()
@@ -155,21 +211,12 @@ def cmd_evaluate(args):
         entry = evaluate.final(_historical(seasons), lines_, abbr)
         print("\n".join(entry))
         return
-    extra = None
-    if args.playoffs == "all":
-        extra = ["## Playoff games in ratings", "",
-                 "Same folds for each setting. October rows are the first month of each season, "
-                 "when ratings lean most on last season's games.", "",
-                 "| Setting | Games | Margin MAE | Total MAE | Winner % | Total bias | October total bias |",
-                 "| --- | --- | --- | --- | --- | --- | --- |"]
-        for mode in ("include", "exclude", "relative"):
-            config.PLAYOFF_GAMES = mode
-            feats = evaluate.validation_rows(_historical(seasons))
-            preds, _ = evaluate.cross_validate(feats, config.VALIDATION_SEASONS)
-            m = evaluate.metrics(preds)
-            october = evaluate.metrics(preds[preds["FOLD"].str.endswith("-10")])
-            extra.append(evaluate._row(f"playoffs {mode}", m, f"{october['total_bias']:+.2f}"))
-        config.PLAYOFF_GAMES = args.playoffs_default
+    names = list(COMPARISONS) if "all" in (args.compare or []) else list(args.compare or [])
+    if args.playoffs == "all" and "playoffs" not in names:
+        names.append("playoffs")
+    extra = []
+    for name in names:
+        extra += ([""] if extra else []) + _comparison(name, seasons)
     print("\n".join(evaluate.run(_historical(seasons), lines_, abbr, extra)))
     print("Saved results/evaluation.md")
     cmd_report(args)
@@ -414,6 +461,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="nbamodel", description="Predict NBA final scores.")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("fetch", help="Download all seasons of data")
+    sub.add_parser("validate", help="Check the downloaded data and list games to spot-check")
     playoff_help = "How playoff games feed ratings (default from config.py)"
     p_train = sub.add_parser("train", help="Fit the regression and save data/model.json")
     p_train.add_argument("--playoffs", choices=["include", "exclude", "relative"], help=playoff_help)
@@ -426,6 +474,9 @@ def main(argv=None):
                         help="Score the locked test season once and log it in results/test_log.md")
     p_eval.add_argument("--playoffs", choices=["include", "exclude", "relative", "all"],
                         help=playoff_help + "; 'all' adds a comparison of the three")
+    p_eval.add_argument("--compare", action="append", choices=[*COMPARISONS, "all"],
+                        help="Add a side-by-side table of a setting's values, with the noise test; "
+                             "'all' does every one (repeatable)")
     inj = sub.add_parser("injuries", help="Show what the injury report reader finds")
     inj.add_argument("--file", help="Read a downloaded injury report PDF instead of fetching the latest")
     sub.add_parser("report", help="Redraw the charts in docs/figures from results/ and data/model.json")
@@ -447,6 +498,8 @@ def main(argv=None):
         config.PLAYOFF_GAMES = args.playoffs
     if args.command == "fetch":
         cmd_fetch(args)
+    elif args.command == "validate":
+        cmd_validate(args)
     elif args.command == "train":
         cmd_train(args)
     elif args.command == "backtest":

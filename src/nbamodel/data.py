@@ -59,17 +59,25 @@ def _league_game_log(season: str, player_or_team: str) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def _finished(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop games still being played. The game log lists them live, with a partial
+    score and no win or loss yet."""
+    if "WL" not in df:
+        return df
+    return df[df["WL"].notna()].reset_index(drop=True)
+
+
 def team_games(season: str, refresh: bool = False) -> pd.DataFrame:
-    """One row per team per game, with box score totals."""
-    df = _cached(f"team_games_{season}", lambda: _league_game_log(season, "T"), refresh)
+    """One row per team per finished game, with box score totals."""
+    df = _finished(_cached(f"team_games_{season}", lambda: _league_game_log(season, "T"), refresh))
     df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
     df["SEASON"] = season
     return df
 
 
 def player_games(season: str, refresh: bool = False) -> pd.DataFrame:
-    """One row per player per game played, with minutes."""
-    df = _cached(f"player_games_{season}", lambda: _league_game_log(season, "P"), refresh)
+    """One row per player per finished game played, with minutes."""
+    df = _finished(_cached(f"player_games_{season}", lambda: _league_game_log(season, "P"), refresh))
     df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
     df["SEASON"] = season
     return df

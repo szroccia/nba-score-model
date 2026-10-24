@@ -13,6 +13,7 @@ The major modeling choices, what was considered, the evidence and the reason for
 | 5 | [Evaluation design](#5-evaluation-design) | Rolling monthly folds, locked test season, Vegas benchmark | Avoids look-ahead and gives an honest bar to beat |
 | 6 | [Playoff games in ratings](#6-playoff-games-in-ratings) | Include | Best total error and early-season bias |
 | 7 | [Ridge strength](#7-ridge-strength) | alpha = 10 | All reasonable values tie; ties go to the simpler model |
+| 8 | [Strength of schedule](#8-strength-of-schedule) | Adjust for opponents | Beat the noise on margin error, after a fix for a flaw that biased totals |
 
 ---
 
@@ -42,7 +43,7 @@ The major modeling choices, what was considered, the evidence and the reason for
 | Player value | Basketball-Reference |
 | Benchmark | ESPN's archive of Vegas closing lines |
 
-stats.nba.com blocks cloud servers, so the data steps run on a home computer. A data-check command (game counts, box scores that add up, team totals matching player totals) is in review alongside the strength-of-schedule change.
+stats.nba.com blocks cloud servers, so the data steps run on a home computer. `python -m nbamodel validate` checks every download: game counts, box scores that add up, team totals matching player totals, and games still in progress, which are left out.
 
 ## 3. Player value
 
@@ -71,14 +72,14 @@ In October, team ratings are mostly last season's games, so this is what account
 **Why.**
 - **No look-ahead:** basketball data is a time series, so random k-fold splits would train on games played after the ones being predicted. Refitting before each month and predicting that month is also exactly how the live model runs.
 - **Untouched test season:** 2025-26 is never used to choose anything. Every look at it is appended to `results/test_log.md`. One earlier look is on record here instead: the first backtest, run in October 2026 before this lock existed, also scored 2025-26 (margin error 11.33 for the regression, 11.46 for the formula). It showed the same thing as the other seasons and settled nothing they didn't. Since then `backtest` leaves the test season out.
-- **A rule fixed in advance:** settings are ranked by margin error, then total error, then total bias nearest zero, with near-ties going to the simpler model.
+- **A rule fixed in advance:** settings are ranked by margin error, then total error, then total bias nearest zero, with near-ties going to the simpler model. From decision 8 on, "near tie" has a measured meaning: a change within the noise (see [decision 8](#8-strength-of-schedule)).
 - **A real bar to beat:** the closing line is the best public forecast.
 
-**Evidence.** On 2,620 validation games the model is within a third of a point of Vegas:
+**Evidence.** On 2,620 validation games the model (as of decision 8) is within a third of a point of Vegas:
 
 | | Margin error | Total error | Winners picked |
 | --- | --- | --- | --- |
-| Model | 10.94 | 14.59 | 66.7% |
+| Model | 10.92 | 14.55 | 67.1% |
 | Vegas closing line | 10.62 | 14.15 | 68.7% |
 
 ![Model vs Vegas by month](figures/vegas_by_month.png)
@@ -114,4 +115,44 @@ In October, team ratings are mostly last season's games, so this is what account
 
 ---
 
-**Next decision:** strength-of-schedule adjusted ratings, judged by the same evaluation.
+## 8. Strength of schedule
+
+**Question.** Should each game be corrected for how good the opponent was? Scoring 120 against a defense that usually allows 110 (an average defense allows 115) would count as 125, and 120 against a weak defense would count for less. Opponent strength comes only from games before each date, so nothing looks ahead.
+
+**Test fixed in advance,** written down before any results existed (October 24, 2026):
+
+1. Score the model with and without the adjustment on the same validation months.
+2. For each game, take the change in the absolute margin error from turning it on, then average the changes.
+3. The adjustment stays only if that average is a drop of more than 2 standard errors.
+4. If the margin change is within that noise, apply the same test to the total error.
+5. If both are within the noise, the simpler model (no adjustment) stays.
+
+**Why pair the games, and why measure noise by month.** Pairing compares the two versions on the very same games, so the noise they share (a 30-point blowout misleads both) cancels out. The standard error is measured month to month: each month is one block, and the noise is how much the change varies between months. Games in the same month share conditions, such as injuries, schedule quirks and the point in the season. Counting every game as independent would make small differences look more certain than they are. Under the old rounding rule, the playoff question would have gone to "exclude" for being 0.02 points better, a gap that was judged to be noise; this test makes that judgment measurable.
+
+**First run (October 24, 2026).** Strength of schedule passed, narrowly.
+
+| Setting | Margin MAE | Total MAE | Winner % | Total bias | October total bias |
+| --- | --- | --- | --- | --- | --- |
+| Off | 10.95 | 14.59 | 66.7% | -0.34 | -0.33 |
+| On | 10.92 | 14.55 | 67.0% | +1.22 | +2.19 |
+
+The margin change was -0.03 points against noise of 0.03. The unrounded change was the larger of the two, so the verdict was "better". Rounded to two decimals, the table and chart looked like a tie, so they now show three. The total change, -0.04 against noise of 0.11, was within the noise.
+
+**A flaw found before switching it on.** Totals went from 0.34 points too low to 1.22 too high, and the test did not look at bias. The first version measured each opponent against the league average, which is built from this season and, more lightly, last season. That average lags when league-wide scoring changes, so the change is mistaken for a tough or easy schedule and shifts every team's ratings. This is the most likely cause of the bias. A test with equal teams and a six-point jump in league scoring shows the first version moving the scoring level by 2 points (`test_opponent_adjustment_ignores_league_wide_scoring_changes`). The fix compares each opponent with the average team's rating on the same day, built the same way, so only differences between teams count.
+
+**Rerun rule, fixed before the rerun (October 24, 2026).** Steve chose to fix the flaw and run the same test once more. The test above is unchanged, and the rerun settles this decision, pass or fail. There is no third version. Both runs stay in this log.
+
+**Rerun (October 24, 2026).**
+
+| Setting | Margin MAE | Total MAE | Winner % | Total bias | October total bias |
+| --- | --- | --- | --- | --- | --- |
+| Off | 10.95 | 14.59 | 66.7% | -0.34 | -0.33 |
+| On | 10.92 | 14.56 | 67.1% | -0.41 | -0.16 |
+
+**Choice: adjust for opponents.**
+- Margin error dropped by 0.027 points against noise of 0.026, so it beats the noise, by a hair. The gain is real but small: about 0.25% of the average miss.
+- Total error dropped by 0.037, within its noise of 0.050.
+- The fix worked. Total bias is back to -0.41, close to the -0.34 without the adjustment, and October bias is the smallest of any setting tried (-0.16).
+- The total noise band halved from the first run (0.11 to 0.05). That is most likely because the first version's bias swung from month to month.
+
+![Strength of schedule](figures/strength_of_schedule.png)

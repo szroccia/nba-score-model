@@ -20,6 +20,9 @@ PRIOR_SEASON_GAME_WEIGHT = 0.4     # last season's games count less once a new s
 #   "relative" - use them, measured against the playoff league average instead of the regular season's
 PLAYOFF_GAMES = "include"   # original behavior; change once the comparison backtest picks a winner
 SHRINK_GAMES = 4                   # pseudo-games of league average added to every rating
+# Strength of schedule: correct each game for how good the opponent was going into it.
+# On since decision 8 (docs/decisions.md): it beat the noise on margin error.
+OPPONENT_ADJUST = True
 
 # Chance a player plays, by official injury report status.
 PLAY_PROBABILITY = {
@@ -66,6 +69,10 @@ TEST_SEASON = "2025-26"
 # Fixed before looking at results: settings are ranked by margin MAE, then total MAE,
 # then how far the average total sits from the actual (closest to zero wins).
 SELECTION_METRICS = ["margin_mae", "total_mae", "abs_total_bias"]
+# On/off comparisons (`evaluate --compare`) use a noise test, fixed before decision 8's results:
+# a change counts only if it moves average error by more than this many standard errors,
+# measured month to month (docs/decisions.md, decision 8).
+NOISE_STANDARD_ERRORS = 2
 # Ridge strengths tried for the complexity curve, and training sizes (team-games) for the learning curve.
 ALPHA_GRID = [0.01, 0.1, 1, 10, 100, 1000, 10000, 100000]
 LEARNING_CURVE_SIZES = [100, 250, 500, 1000, 2000, 4000]

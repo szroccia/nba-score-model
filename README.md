@@ -10,7 +10,7 @@ Validation seasons 2023-24 and 2024-25, 2,620 games. Each month is predicted by 
 
 | | Margin error (points) | Total error (points) | Winners picked |
 | --- | --- | --- | --- |
-| This model | 10.94 | 14.59 | 66.7% |
+| This model | 10.92 | 14.55 | 67.1% |
 | Vegas closing line | 10.62 | 14.15 | 68.7% |
 
 ![Model vs Vegas by month](docs/figures/vegas_by_month.png)
@@ -21,7 +21,7 @@ The 2025-26 season is held back as a locked test set; see [How it's evaluated](#
 
 ```mermaid
 flowchart LR
-    A[Box scores] --> B[Team pace and<br/>efficiency ratings]
+    A[Box scores] --> B[Team pace and<br/>efficiency ratings,<br/>adjusted for opponents]
     B --> C[Pace x efficiency<br/>formula]
     D[Injury report and<br/>current rosters] --> E[Tonight's lineup<br/>vs usual lineup]
     F[Player Box Plus/Minus] --> E
@@ -34,7 +34,7 @@ flowchart LR
 Each team's points come from four ideas:
 
 1. **Pace.** How many possessions the game will have, from both teams' recent pace.
-2. **Efficiency.** The team's offensive rating (points per 100 possessions) against the opponent's defensive rating, weighted toward recent games.
+2. **Efficiency.** The team's offensive rating (points per 100 possessions) against the opponent's defensive rating, weighted toward recent games. Each past game is corrected for how good that opponent was, so a team with a hard schedule isn't underrated.
 3. **Tonight's lineup.** Who is in and out. Each player's Box Plus/Minus is weighed against the minutes he is expected to play tonight compared with recent games, so a star sitting out lowers his team's offense and defense.
 4. **Context.** Home court, days of rest and back-to-backs.
 
@@ -52,11 +52,11 @@ The regression then adds the adjustments for lineups, home court and rest. `pyth
 
 ![Model coefficients](docs/figures/coefficients.png)
 
-The formula is taken almost exactly at face value (about 0.98). Home court is worth about 2 points, and facing a team on the second night of a back-to-back about 1. The coefficients are saved in `data/model.json`, and every tunable setting (rating half-life, injury status probabilities, replacement-level BPM and so on) is in `src/nbamodel/config.py`.
+The formula is taken almost exactly at face value (about 0.99). Home court is worth about 2 points, and facing a team on the second night of a back-to-back about 1. The coefficients are saved in `data/model.json`, and every tunable setting (rating half-life, injury status probabilities, replacement-level BPM and so on) is in `src/nbamodel/config.py`.
 
 | Feature | Meaning |
 | --- | --- |
-| `BASE_PTS` | Possession formula above, using recency-weighted ratings |
+| `BASE_PTS` | Possession formula above, using recency-weighted, opponent-adjusted ratings |
 | `LINEUP_OFF_PTS` | Points gained or lost from who plays for this team tonight |
 | `LINEUP_DEF_PTS` | Points gained or lost from who plays for the opponent tonight |
 | `IS_HOME` | Home team flag |
@@ -100,6 +100,7 @@ Each is explained with its evidence in the [decision log](docs/decisions.md):
 - [Official data sources](docs/decisions.md#2-data-sources) and [Box Plus/Minus](docs/decisions.md#3-player-value) for player value
 - [Rolling monthly evaluation with a locked test season](docs/decisions.md#5-evaluation-design)
 - [Playoff games kept in ratings](docs/decisions.md#6-playoff-games-in-ratings) and [ridge alpha 10](docs/decisions.md#7-ridge-strength)
+- [Strength-of-schedule adjustment](docs/decisions.md#8-strength-of-schedule), kept because it beat a noise test fixed in advance
 
 ## Data
 
@@ -125,15 +126,21 @@ source .venv/bin/activate        # Windows Git Bash: source .venv/Scripts/activa
 pip install -e ".[dev]"
 
 python -m nbamodel fetch         # download six seasons of data (about 10 minutes)
+python -m nbamodel validate      # sanity checks + games to compare with nba.com
 python -m nbamodel train         # fit the model, writes data/model.json
 python -m nbamodel backtest      # accuracy by season, writes results/backtest.md
 python -m nbamodel evaluate      # cross-validation, tuning curves, Vegas benchmark (results/evaluation.md)
+python -m nbamodel evaluate --compare all   # adds a with/without table for each setting decision
 python -m nbamodel report        # redraw the charts in docs/figures
 python -m nbamodel predict       # today's games
 python -m nbamodel explain --game BOS   # chart of how one game's prediction is built
 ```
 
 `predict` accepts `--date YYYY-MM-DD` and `--no-injury-report` (use only `manual_status.csv`).
+
+## Checking the data
+
+`python -m nbamodel validate` checks every season's download: game counts (1,230 per regular season), two teams per game, box scores that add up (points = 2 x FGM + 3PM + FTM), team totals that match the separately downloaded player totals, and how many minutes were matched to a Basketball-Reference BPM. It also prints a few random games with links to their official nba.com box scores so you can compare by eye. The raw CSV files are all in `data/`.
 
 ## Daily updates
 
@@ -165,7 +172,6 @@ When a later run changes a prediction by a point or more, the change and the pla
 
 ## Limitations and ideas
 
-- Ratings are not adjusted for strength of schedule yet.
 - The model is limited by its inputs rather than by data (see the [learning curve](docs/decisions.md#7-ridge-strength)), so richer features are the next step.
 - Minutes for absent players are redistributed in proportion to usual minutes, not by position.
 - Rookies have no NBA minutes or BPM, so they count only once they start playing.

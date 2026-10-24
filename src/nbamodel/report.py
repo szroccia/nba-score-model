@@ -287,6 +287,50 @@ def playoff_settings(table: pd.DataFrame, chosen: str, out):
     return _save(fig, out)
 
 
+VERDICT_PHRASES = {"better": "beats the noise", "worse": "is worse beyond the noise",
+                   "tie": "is within the noise"}
+
+
+def noise_test(table: pd.DataFrame, heading: str, out):
+    """An on/off decision under the noise test: each change in average error, with a bar for
+    the noise (2 standard errors, month to month). A bar that crosses zero is a tie."""
+    current = table.loc[table["Verdict"] == "current", "Setting"].iloc[0]
+    others = table[table["Verdict"] != "current"]
+    items = []
+    for _, r in others.iterrows():
+        prefix = f"{r['Setting']}: " if len(others) > 1 else ""
+        for metric in ("Margin", "Total"):
+            items.append((f"{prefix}{metric} error", float(r[f"{metric} change"]), float(r[f"{metric} noise"])))
+    fig, ax = _figure(1, 8, 3.4)
+    _style(ax, "", grid_axis="x")
+    y = list(range(len(items)))[::-1]
+    for yi, (_, change, noise) in zip(y, items):
+        # Square ends, so a bar stops exactly at the noise and whether it reaches zero is readable.
+        ax.plot([change - noise, change + noise], [yi, yi], color=GRAY, linewidth=6, solid_capstyle="butt")
+        ax.scatter([change], [yi], s=90, color=BLUE, edgecolor=SURFACE, linewidth=2, zorder=3)
+        ax.annotate(f"{change:+.3f} \u00b1 {noise:.3f}", (change, yi), xytext=(0, 11),
+                    textcoords="offset points", ha="center", fontsize=9, color=INK, zorder=4,
+                    bbox={"boxstyle": "square,pad=0.15", "facecolor": SURFACE, "edgecolor": "none"})
+    ax.axvline(0, color=MUTED, linewidth=1)
+    reach = max(max(abs(c) + n for _, c, n in items) * 1.6, 0.1)
+    ax.set_xlim(-reach, reach)
+    ax.set_ylim(-0.7, len(items) - 0.3)
+    ax.set_yticks(y, [name for name, _, _ in items])
+    ax.tick_params(axis="y", labelcolor=INK)
+    ax.set_xlabel("Change in average error, points (below zero is better)", fontsize=9, color=MUTED)
+    verdict = others["Verdict"].iloc[0]
+    games = int(others["Games"].iloc[0])
+    # Name the setting being judged, so the headline still reads right once it becomes current
+    # ("Strength of schedule off is worse beyond the noise").
+    judged = f" {others['Setting'].iloc[0]}" if len(others) == 1 else ""
+    _headline(fig, f"{heading}{judged} {VERDICT_PHRASES.get(verdict, verdict)}",
+              f"Against the current setting ({current}) on the same {games:,} validation games. Gray bars are "
+              "the noise (2 standard errors, month to month); a bar crossing zero is a tie, and a tie keeps "
+              "the simpler model.")
+    fig.subplots_adjust(left=0.17, right=0.95, top=0.7, bottom=0.2)
+    return _save(fig, out)
+
+
 def cv_scheme(out):
     """How evaluation splits time: rolling monthly folds on validation seasons, test season locked."""
     plt = _plt()
@@ -394,6 +438,9 @@ def run(fig_dir=None) -> list:
                                     fig_dir / "ridge_alpha.png"))
         if "Learning curve" in tables:
             made.append(learning_curve(tables["Learning curve"], fig_dir / "learning_curve.png"))
+        if "Strength of schedule" in tables:
+            made.append(noise_test(tables["Strength of schedule"], "Strength of schedule",
+                                   fig_dir / "strength_of_schedule.png"))
         if "Playoff games in ratings" in tables:
             made.append(playoff_settings(tables["Playoff games in ratings"], config.PLAYOFF_GAMES,
                                          fig_dir / "playoff_settings.png"))

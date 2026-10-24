@@ -79,31 +79,82 @@ def league_average(games: pd.DataFrame, date: pd.Timestamp, season: str) -> dict
     }
 
 
+def _blend_history(seasons: np.ndarray, values: dict, season: str, league: dict) -> dict:
+    """Recency-weighted average of a team's past games (most recent first), shrunk toward
+    the league average. Last season's games count less once the new season has begun."""
+    w = 0.5 ** (np.arange(len(seasons)) / config.RATING_HALF_LIFE_GAMES)
+    w = w * np.where(seasons == season, 1.0, config.PRIOR_SEASON_GAME_WEIGHT)
+    shrink = config.SHRINK_GAMES
+    total = w.sum() + shrink
+    prior = {"PACE": league["PACE"], "ORTG": league["ORTG"], "DRTG": league["ORTG"]}
+    return {k: float((np.dot(w, v) + shrink * prior[k]) / total) for k, v in values.items()}
+
+
 def team_rating(games: pd.DataFrame, team_id: int, date: pd.Timestamp, season: str,
                 league: dict) -> dict:
-    """Recency-weighted pace, offensive and defensive rating for one team before a date."""
+    """Recency-weighted pace, offensive and defensive rating for one team before a date.
+
+    Uses the opponent-adjusted columns when opponent_adjust added them."""
     games = _rating_games(games)
     past = games[
         (games["TEAM_ID"] == team_id)
         & (games["GAME_DATE"] < date)
         & games["SEASON"].isin(_seasons_in_window(season))
     ].sort_values("GAME_DATE", ascending=False)
-    games_ago = np.arange(len(past))
-    w = 0.5 ** (games_ago / config.RATING_HALF_LIFE_GAMES)
-    w = w * np.where(past["SEASON"] == season, 1.0, config.PRIOR_SEASON_GAME_WEIGHT)
-    shrink = config.SHRINK_GAMES
-    total = w.sum() + shrink
+    suffix = "_ADJ" if "ORTG_ADJ" in games else ""
+    rating = _blend_history(
+        past["SEASON"].to_numpy(),
+        {k: past[k + suffix].to_numpy() for k in ("PACE", "ORTG", "DRTG")},
+        season,
+        league,
+    )
+    rating["GAMES"] = int(len(past))
+    rating["CURRENT_GAMES"] = int((past["SEASON"] == season).sum())
+    return rating
 
-    def blend(col, prior):
-        return float((np.dot(w, past[col]) + shrink * prior) / total)
 
-    return {
-        "PACE": blend("PACE", league["PACE"]),
-        "ORTG": blend("ORTG", league["ORTG"]),
-        "DRTG": blend("DRTG", league["ORTG"]),
-        "GAMES": int(len(past)),
-        "CURRENT_GAMES": int((past["SEASON"] == season).sum()),
-    }
+def opponent_adjust(games: pd.DataFrame) -> pd.DataFrame:
+    """Add PACE_ADJ, ORTG_ADJ and DRTG_ADJ: each game's numbers corrected for how good
+    the opponent was going into it (strength of schedule).
+
+    Scoring 120 against a defense that allows 110, when the average team's defense
+    allows 115, counts as 125. Opponents are compared with the average team's rating on
+    the same day, built the same way, so a league-wide rise or fall in scoring is not
+    mistaken for a tough or easy schedule. Opponent ratings are themselves built from
+    earlier adjusted games, so the correction compounds through the season, and no game
+    uses information from after it. Pass every season at once: early in a season,
+    opponents are then judged on last season's games too, the same two-season window
+    team ratings use."""
+    df = games.sort_values(["GAME_DATE", "GAME_ID", "TEAM_ID"]).reset_index(drop=True)
+    adj = {k: df[k].to_numpy(dtype=float).copy() for k in ("PACE", "ORTG", "DRTG")}
+    raw = {k: df[k].to_numpy(dtype=float) for k in ("PACE", "ORTG", "DRTG")}
+    seasons = df["SEASON"].to_numpy()
+    teams, opps = df["TEAM_ID"].to_numpy(), df["OPP_TEAM_ID"].to_numpy()
+    playoff = df["PLAYOFF"].to_numpy(dtype=bool) if "PLAYOFF" in df else np.zeros(len(df), dtype=bool)
+    history: dict = {}  # team -> row indexes already adjusted, oldest first
+    for date, rows in df.groupby("GAME_DATE", sort=True).indices.items():
+        season = seasons[rows[0]]
+        league = league_average(df, date, season)
+        window = list(_seasons_in_window(season))
+        blend = {}  # every team with games in the window, plus anyone playing today
+        for team in set(history) | set(teams[rows]):
+            past = np.array(history.get(team, []), dtype=int)[::-1]
+            past = past[np.isin(seasons[past], window)]
+            if len(past) or team in teams[rows]:
+                blend[team] = _blend_history(seasons[past], {k: adj[k][past] for k in adj}, season, league)
+        # The league average lags when scoring changes; the average team's rating moves with it.
+        avg = {k: float(np.mean([b[k] for b in blend.values()])) for k in adj}
+        for i in rows:
+            opp = blend[opps[i]]
+            adj["ORTG"][i] = raw["ORTG"][i] - (opp["DRTG"] - avg["DRTG"])
+            adj["DRTG"][i] = raw["DRTG"][i] - (opp["ORTG"] - avg["ORTG"])
+            adj["PACE"][i] = raw["PACE"][i] * avg["PACE"] / opp["PACE"]
+        for i in rows:
+            if config.PLAYOFF_GAMES != "exclude" or not playoff[i]:
+                history.setdefault(teams[i], []).append(i)
+    for k in ("PACE", "ORTG", "DRTG"):
+        df[k + "_ADJ"] = adj[k]
+    return df
 
 
 def rest_days(games: pd.DataFrame, team_id: int, date: pd.Timestamp) -> int:

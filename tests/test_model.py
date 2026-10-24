@@ -173,6 +173,82 @@ def test_roster_moves_count_departures_and_newcomers():
     assert adj["MISSING"] == ""          # departed players aren't listed as injured
 
 
+def test_opponent_adjustment_credits_tough_schedule(monkeypatch):
+    from nbamodel import config
+
+    monkeypatch.setattr(config, "OPPONENT_ADJUST", True)
+    # Teams 1 and 2 score 112 every night. Team 1 always plays team 4, whose defense also
+    # gives up 125 to team 5; team 2 always plays team 5, which holds team 4 to 100.
+    # Team 2 scored the same against a much better defense, so it should rate higher.
+    rows = []
+    day = pd.Timestamp("2024-10-20")
+    gid = 0
+    for rnd in range(40):
+        day += pd.Timedelta(days=1)
+        for team, opp, pts, opp_pts in ((1, 4, 112, 112), (2, 5, 112, 112), (4, 5, 100, 125)):
+            gid += 1
+            for t, o, p, home in ((team, opp, pts, True), (opp, team, opp_pts, False)):
+                rows.append({"TEAM_ID": t, "TEAM_ABBREVIATION": f"T{t}", "GAME_ID": gid, "GAME_DATE": day,
+                             "MATCHUP": f"T{t} vs. T{o}" if home else f"T{t} @ T{o}", "MIN": 240,
+                             "FGA": 88, "FTA": 22, "OREB": 10, "TOV": 14, "PTS": p, "SEASON": "2024-25"})
+    games = ratings.opponent_adjust(ratings.team_game_table(pd.DataFrame(rows)))
+    end = day + pd.Timedelta(days=1)
+    league = ratings.league_average(games, end, "2024-25")
+    a = ratings.team_rating(games, 1, end, "2024-25", league)
+    b = ratings.team_rating(games, 2, end, "2024-25", league)
+    assert b["ORTG"] > a["ORTG"] + 3
+
+    # Opening night of the next season: team 4's leaky defense is known from last season,
+    # so 112 against it counts for less than 112 raw.
+    opener = pd.DataFrame([{**rows[0], "GAME_ID": 999, "GAME_DATE": pd.Timestamp("2025-10-21"), "SEASON": "2025-26",
+                            "PTS": 112, "TEAM_ID": t, "TEAM_ABBREVIATION": f"T{t}",
+                            "MATCHUP": f"T{t} vs. T{o}" if t == 1 else f"T{t} @ T{o}"} for t, o in ((1, 4), (4, 1))])
+    both = pd.concat([ratings.team_game_table(pd.DataFrame(rows)), ratings.team_game_table(opener)], ignore_index=True)
+    first = ratings.opponent_adjust(both).query("GAME_ID == 999 and TEAM_ID == 1").iloc[0]
+    assert first["ORTG_ADJ"] < first["ORTG"] - 1
+
+
+def test_opponent_adjustment_ignores_league_wide_scoring_changes():
+    """Equal teams, so there is no schedule to correct for, while league scoring jumps six
+    points between seasons. The adjustment must leave the scoring level alone."""
+    rng = np.random.default_rng(0)
+    rows, gid = [], 0
+    for season, level in (("2023-24", 110.0), ("2024-25", 116.0)):
+        for d in range(50):
+            day = pd.Timestamp(f"{season[:4]}-10-20") + pd.Timedelta(days=d)
+            teams = rng.permutation(10)
+            for a, b in zip(teams[::2], teams[1::2]):
+                gid += 1
+                pa, pb = level + rng.normal(0, 11), level + rng.normal(0, 11)
+                for t, o, f, ag in ((a, b, pa, pb), (b, a, pb, pa)):
+                    rows.append({"GAME_ID": gid, "GAME_DATE": day, "SEASON": season, "TEAM_ID": t,
+                                 "OPP_TEAM_ID": o, "PLAYOFF": False, "PACE": 99.0, "ORTG": f, "DRTG": ag})
+    adj = ratings.opponent_adjust(pd.DataFrame(rows)).query("SEASON == '2024-25'")
+    raw_level = adj["ORTG"].mean() + adj["DRTG"].mean()
+    assert abs(adj["ORTG_ADJ"].mean() + adj["DRTG_ADJ"].mean() - raw_level) < 0.5
+
+
+def test_validate_flags_bad_box_scores(monkeypatch):
+    from nbamodel import data, validate
+
+    def row(gid, team, pts, fgm, fg3m, ftm):
+        return {"GAME_ID": gid, "TEAM_ID": team, "TEAM_ABBREVIATION": f"T{team}", "GAME_DATE": "2025-01-01",
+                "PTS": pts, "FGM": fgm, "FG3M": fg3m, "FTM": ftm}
+    teams = pd.DataFrame([row(22400001, 1, 110, 40, 12, 18), row(22400001, 2, 105, 40, 10, 15),
+                          row(22400002, 1, 99, 40, 12, 18), row(22400002, 3, 100, 38, 9, 15)])
+    players = teams[["GAME_ID", "TEAM_ID", "PTS"]].copy()
+    players.loc[0, "PTS"] = 100          # player totals disagree with the team total once
+    monkeypatch.setattr(data, "team_games", lambda s, refresh=False: teams)
+    monkeypatch.setattr(data, "player_games", lambda s, refresh=False: players)
+    results = {name: passed for name, passed, _ in validate.check_season("2024-25", complete=False)}
+    assert results["two teams in every game"]
+    assert not results["points = 2 x FGM + 3PM + FTM"]          # 99 != 2*40+12+18
+    assert not results["team points = sum of player points"]
+    assert not results["30 teams"]
+    links = validate.spot_check_games("2024-25", n=2, seed=0)["box score"]
+    assert set(links) == {"https://www.nba.com/game/0022400001", "https://www.nba.com/game/0022400002"}
+
+
 def test_report_chart_from_backtest_table(tmp_path):
     from nbamodel import report
 
@@ -438,6 +514,18 @@ def test_bpm_before_it_is_published(monkeypatch, tmp_path):
     assert lineup.player_impact(data.bpm("2025-26", refresh=True), df).empty
 
 
+def test_games_in_progress_are_left_out(monkeypatch, tmp_path):
+    """A download during a game saves its partial score with no win or loss yet."""
+    from nbamodel import config, data
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    rows = "GAME_ID,GAME_DATE,TEAM_ID,PTS,WL\n1,2026-10-21,10,128,W\n1,2026-10-21,20,116,L\n2,2026-10-23,30,34,\n2,2026-10-23,40,39,\n"
+    (tmp_path / "team_games_2026-27.csv").write_text(rows)
+    (tmp_path / "player_games_2026-27.csv").write_text(rows.replace("TEAM_ID", "PLAYER_ID"))
+    assert set(data.team_games("2026-27")["GAME_ID"]) == {1}
+    assert set(data.player_games("2026-27")["GAME_ID"]) == {1}
+
+
 def test_warns_when_report_does_not_cover_a_team(capsys):
     from nbamodel import cli
 
@@ -508,3 +596,57 @@ def test_push_predictions_uses_its_own_branch(monkeypatch, tmp_path):
     assert git("rev-list", "--count", "predictions", cwd=remote) == "2"
     assert git("rev-parse", "HEAD", cwd=repo) == head          # the code branch didn't move
     assert git("status", "--porcelain", "--", "code.py", cwd=repo) == ""
+
+
+def _games_with_errors(margin_err, total_err, folds):
+    """A game frame like evaluate.game_frame where predictions miss by the given amounts."""
+    n = len(margin_err)
+    return pd.DataFrame({"GAME_ID": range(n), "FOLD": folds, "MARGIN": 0.0, "TOTAL": 220.0,
+                         "PRED_MARGIN": margin_err, "PRED_TOTAL": 220.0 + np.asarray(total_err)})
+
+
+def test_noise_test_needs_a_change_bigger_than_the_noise():
+    from nbamodel import evaluate
+
+    rng = np.random.default_rng(0)
+    folds = np.repeat([f"2024-{m:02d}" for m in range(1, 11)], 100)
+    base = _games_with_errors(rng.normal(0, 12, 1000), rng.normal(0, 18, 1000), folds)
+    # Every game a point better on the margin: beats the noise.
+    better = base.assign(PRED_MARGIN=base["PRED_MARGIN"] * (1 - 1 / base["PRED_MARGIN"].abs().clip(lower=1)))
+    assert evaluate.noise_test(base, better)["verdict"] == "better"
+    # The same predictions: a tie.
+    assert evaluate.noise_test(base, base.copy())["verdict"] == "tie"
+    # Two points better in half the months and two points worse in the rest averages out:
+    # month-to-month blocks make that a tie, even though every single game changed.
+    sign = np.where(pd.Series(folds).str[-2:].astype(int) % 2 == 0, -2.0, 2.0)
+    mixed = base.assign(PRED_MARGIN=np.sign(base["PRED_MARGIN"]) * (base["PRED_MARGIN"].abs() + sign).clip(lower=0))
+    change, se = evaluate.paired_change(base, mixed, "MARGIN")
+    assert abs(change) < 2 * se
+    # Worse on total error, with no margin change: worse.
+    worse = base.assign(PRED_TOTAL=220.0 + np.sign(base["PRED_TOTAL"] - 220) * ((base["PRED_TOTAL"] - 220).abs() + 3))
+    assert evaluate.noise_test(base, worse)["verdict"] == "worse"
+
+
+def test_evaluate_compares_strength_of_schedule(monkeypatch, tmp_path):
+    from nbamodel import cli, config
+
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "OPPONENT_ADJUST", False)
+    monkeypatch.setattr(config, "VALIDATION_SEASONS", ["2023-24", "2024-25"])
+    monkeypatch.setattr(config, "TEST_SEASON", "2025-26")
+    monkeypatch.setattr(config, "ALPHA_GRID", [1, 100])
+    monkeypatch.setattr(config, "LEARNING_CURVE_SIZES", [100, 400])
+    monkeypatch.setattr(config, "MODEL_PATH", tmp_path / "missing.json")
+    plain = _fake_features()
+    # With the adjustment on, the formula sits closer to what actually happened.
+    sharper = plain.assign(BASE_PTS=(plain["BASE_PTS"] + plain["PTS"] - 1.5 * (2 * plain["IS_HOME"] - 1)) / 2)
+    monkeypatch.setattr(cli, "_historical", lambda seasons: sharper if config.OPPONENT_ADJUST else plain)
+    monkeypatch.setattr(cli, "_vegas_lines", lambda: None)
+    cli.main(["evaluate", "--compare", "sos"])
+    tables = __import__("nbamodel.report", fromlist=["read_tables"]).read_tables(tmp_path / "results" / "evaluation.md")
+    sos = tables["Strength of schedule"]
+    assert sos["Setting"].tolist() == ["off", "on"]
+    assert sos["Verdict"].tolist() == ["current", "better"]
+    assert sos.loc[1, "Margin change"] < 0
+    assert (tmp_path / "docs" / "figures" / "strength_of_schedule.png").exists()
+    assert config.OPPONENT_ADJUST is False  # restored after the comparison

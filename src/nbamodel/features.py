@@ -25,6 +25,9 @@ def settings() -> dict:
         "half_life": config.RATING_HALF_LIFE_GAMES,
         "prior_season_weight": config.PRIOR_SEASON_GAME_WEIGHT,
         "shrink_games": config.SHRINK_GAMES,
+        # Names the method, so features saved under the first version (opponents compared
+        # with the league average) are never reused; features with it off are unchanged.
+        "opponent_adjust": "vs average team" if config.OPPONENT_ADJUST else False,
         "replacement_obpm": config.REPLACEMENT_OBPM,
         "replacement_dbpm": config.REPLACEMENT_DBPM,
         "bpm_prior_minutes": config.BPM_PRIOR_MINUTES,
