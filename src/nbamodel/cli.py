@@ -390,7 +390,7 @@ def _log_changes(old: pd.DataFrame, new: pd.DataFrame, day: str) -> None:
                 f"{r.home}: {r.home_missing or 'none'}; {r.away}: {r.away_missing or 'none'}"
             )
     if lines:
-        with open(config.PREDICTIONS_DIR / f"{day}_changes.md", "a") as f:
+        with open(config.PREDICTIONS_DIR / f"{day}_changes.md", "a", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
         print("\n".join(lines))
 

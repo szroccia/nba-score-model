@@ -154,7 +154,13 @@ Mac/Linux, with `crontab -e` (times are your computer's local time):
 0 18 * * *  /path/to/nba-score-model/run_daily.sh >> /tmp/nba-daily.log 2>&1
 ```
 
-Windows: in Task Scheduler, create a task that runs `run_daily.bat` daily at those times.
+Windows: run this once from the repo folder (in Git Bash, PowerShell or Command Prompt):
+
+```
+powershell -ExecutionPolicy Bypass -File schedule_daily.ps1
+```
+
+It adds a Task Scheduler task, "NBA daily predictions", that runs `run_daily.bat` at 11:00 and 18:00 and appends each run's output to `daily.log`. A console window shows while it runs. The computer needs to be on or asleep (the task wakes it) and you need to be signed in; a missed run is harmless, because the next one catches up on every game since. To test it now, run `schtasks /run /tn "NBA daily predictions"` (in Git Bash, `schtasks //run //tn "NBA daily predictions"`) and check `daily.log` a few minutes later. To remove it, `schtasks /delete /tn "NBA daily predictions" /f`.
 
 When a later run changes a prediction by a point or more, the change and the players behind it are added to `predictions/<date>_changes.md`.
 
