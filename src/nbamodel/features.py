@@ -14,6 +14,19 @@ FEATURES = [
     "B2B",               # second night of a back-to-back
     "OPP_B2B",
 ]
+# Four-factor matchup edges, in percentage points: this team's offense plus the opponent's
+# defense, minus twice the league average. Used only when config.FOUR_FACTORS is on.
+FACTOR_FEATURES = {
+    "EFG_EDGE": "EFG_PCT",   # shooting: effective field goal %
+    "TOV_EDGE": "TOV_PCT",   # turnovers per possession
+    "ORB_EDGE": "ORB_PCT",   # share of its own misses the offense rebounds
+    "FT_EDGE": "FT_RATE",    # free throws made per field goal attempt
+}
+
+
+def inputs() -> list[str]:
+    """The regression's inputs under the current settings."""
+    return FEATURES + (list(FACTOR_FEATURES) if config.FOUR_FACTORS else [])
 
 
 def settings() -> dict:
@@ -73,6 +86,8 @@ def matchup_rows(games: pd.DataFrame, player_games: pd.DataFrame, impact: pd.Dat
                 "OPP_REST": rest[opp],
                 "B2B": int(rest[team] == 0),
                 "OPP_B2B": int(rest[opp] == 0),
+                **{name: 100 * (rating[team][f] + rating[opp]["OPP_" + f] - 2 * league[f])
+                   for name, f in FACTOR_FEATURES.items()},
                 "MISSING": adj[team]["MISSING"],
             }
         )

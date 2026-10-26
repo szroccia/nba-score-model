@@ -108,7 +108,8 @@ def noise_test(base: pd.DataFrame, other: pd.DataFrame) -> dict:
     other is "better" only if it lowers margin error by more than NOISE_STANDARD_ERRORS
     standard errors, or is within the noise on margin and lowers total error by that much;
     "worse" the same way in the other direction; otherwise a "tie", which goes to the simpler
-    model."""
+    model. From decision 9 on, a "better" change that moves the average total more than
+    BIAS_GUARD_POINTS further from the actual "fails bias guard" and is turned down."""
     k = config.NOISE_STANDARD_ERRORS
     out = {t: paired_change(base, other, t.upper()) for t in ("margin", "total")}
     out["verdict"] = "tie"
@@ -117,6 +118,10 @@ def noise_test(base: pd.DataFrame, other: pd.DataFrame) -> dict:
         if abs(change) > k * se:
             out["verdict"] = "better" if change < 0 else "worse"
             break
+    bias = [abs(float((df["PRED_TOTAL"] - df["TOTAL"]).mean())) for df in (base, other)]
+    out["bias_change"] = bias[1] - bias[0]
+    if out["verdict"] == "better" and out["bias_change"] > config.BIAS_GUARD_POINTS:
+        out["verdict"] = "fails bias guard"
     return out
 
 
@@ -181,7 +186,7 @@ def vegas_comparison(preds: pd.DataFrame, vegas_lines: pd.DataFrame) -> pd.DataF
 
 
 def settings() -> dict:
-    return {"alpha": config.RIDGE_ALPHA, **features.settings()}
+    return {"alpha": config.RIDGE_ALPHA, "four_factors": config.FOUR_FACTORS, **features.settings()}
 
 
 def _md_table(df: pd.DataFrame, columns: dict) -> list[str]:

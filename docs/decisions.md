@@ -14,6 +14,7 @@ The major modeling choices, what was considered, the evidence and the reason for
 | 6 | [Playoff games in ratings](#6-playoff-games-in-ratings) | Include | Best total error and early-season bias |
 | 7 | [Ridge strength](#7-ridge-strength) | alpha = 10 | All reasonable values tie; ties go to the simpler model |
 | 8 | [Strength of schedule](#8-strength-of-schedule) | Adjust for opponents | Beat the noise on margin error, after a fix for a flaw that biased totals |
+| 9 | [Four factors](#9-four-factors) | Left out | Worse on margin error beyond the noise, though better on totals |
 
 ---
 
@@ -156,3 +157,43 @@ The margin change was -0.03 points against noise of 0.03. The unrounded change w
 - The total noise band halved from the first run (0.11 to 0.05). That is most likely because the first version's bias swung from month to month.
 
 ![Strength of schedule](figures/strength_of_schedule.png)
+
+## 9. Four factors
+
+**Question.** Two teams with the same efficiency can get there in different ways. Does knowing how a team scores, and not just how much, help predict its next game? Dean Oliver's four factors split efficiency into:
+
+| Factor | Measure |
+| --- | --- |
+| Shooting | Effective field goal %: (FGM + 0.5 x 3PM) / FGA |
+| Turnovers | Turnovers per possession: TOV / (FGA + 0.44 x FTA + TOV) |
+| Offensive rebounding | Share of its own misses the offense rebounds: OREB / (OREB + opponent DREB) |
+| Free throws | Free throws made per field goal attempt: FTM / FGA |
+
+Each is tracked for a team's offense and for its defense (what opponents did against it), built like the ratings: recent games weighted more, last season counted less, and shrunk toward the league average. They are not adjusted for opponents. For each game, four matchup edges go into the regression, in percentage points: this team's offense plus the opponent's defense, minus twice the league average.
+
+**Choice of design (Steve, October 25, 2026): next to the formula.** The pace x efficiency formula stays, and the four edges are added as inputs (12 instead of 8). Their weights say how much of each kind of edge carries into the next game beyond what the formula already counts. The other option was to rebuild efficiency from the factors alone.
+
+**Test fixed in advance,** written down before any results existed (October 25, 2026). It is decision 8's test with one guard added:
+
+1. Score the model with and without the four edges on the same validation months. Everything else, the features included, is identical.
+2. For each game, take the change in the absolute margin error, then average the changes.
+3. The factors stay only if that average is a drop of more than 2 standard errors, measured month to month.
+4. If the margin change is within that noise, apply the same test to the total error.
+5. If both are within the noise, the simpler model (without the factors) stays.
+6. **Bias guard.** Even if they pass, the factors stay off if the average total moves more than 0.5 points further from the actual. Decision 8's first run passed the noise test while pushing totals 1.2 points too high; this rule catches that case (`config.BIAS_GUARD_POINTS`, applied to every comparison from here on).
+
+**Result (October 25, 2026).**
+
+| Setting | Margin MAE | Total MAE | Winner % | Total bias | October total bias |
+| --- | --- | --- | --- | --- | --- |
+| Off | 10.92 | 14.56 | 67.1% | -0.41 | -0.16 |
+| On | 10.95 | 14.51 | 67.0% | -0.15 | +0.37 |
+
+**Choice: leave them out.**
+- Margin error rose by 0.029 points against noise of 0.028, so it is worse beyond the noise, by a hair. Margin decides first, so the factors stay off.
+- Total error fell by 0.049 against noise of 0.036, a real gain on totals, and the average total moved closer to the actual (-0.15). Because margin had already decided, the test never reaches total.
+- Read together, the two results suggest the factors say something about how many points a game will have, but blur which team is better. Using them for the total only would be a different design, so it would need its own decision and its own test written in advance.
+- The code stays, switched off (`FOUR_FACTORS = False`), so the factors can be tried again later without rebuilding anything.
+
+![Four factors](figures/four_factors.png)
+

@@ -5,6 +5,15 @@ import pandas as pd
 
 from . import config
 
+# Dean Oliver's four factors, for each team's offense; the OPP_ versions are what its
+# opponents did against it (its defense).
+FACTORS = ("EFG_PCT", "TOV_PCT", "ORB_PCT", "FT_RATE")
+OPP_FACTORS = tuple("OPP_" + f for f in FACTORS)
+_BOX = ["FGM", "FG3M", "FGA", "FTM", "FTA", "OREB", "DREB", "TOV"]
+# Recent league levels, used only before any games have been played.
+_LEAGUE_START = {"PACE": 99.0, "ORTG": 114.0, "EFG_PCT": 0.54, "TOV_PCT": 0.125, "ORB_PCT": 0.24,
+                 "FT_RATE": 0.19}
+
 
 def team_game_table(team_games: pd.DataFrame) -> pd.DataFrame:
     """Turn the league game log into one row per team per game with possessions and ratings."""
@@ -13,8 +22,8 @@ def team_game_table(team_games: pd.DataFrame) -> pd.DataFrame:
     df["IS_HOME"] = df["MATCHUP"].str.contains("vs.").astype(int)
     # Playoff game ids start with 004; regular season with 002.
     df["PLAYOFF"] = df["GAME_ID"].astype(str).str.zfill(10).str.startswith("004")
-    opp = df[["GAME_ID", "TEAM_ID", "PTS", "POSS_EST"]].rename(
-        columns={"TEAM_ID": "OPP_TEAM_ID", "PTS": "OPP_PTS", "POSS_EST": "OPP_POSS_EST"}
+    opp = df[["GAME_ID", "TEAM_ID", "PTS", "POSS_EST", *_BOX]].rename(
+        columns={"TEAM_ID": "OPP_TEAM_ID", **{c: "OPP_" + c for c in ["PTS", "POSS_EST", *_BOX]}}
     )
     df = df.merge(opp, on="GAME_ID")
     df = df[df["TEAM_ID"] != df["OPP_TEAM_ID"]].copy()
@@ -23,8 +32,13 @@ def team_game_table(team_games: pd.DataFrame) -> pd.DataFrame:
     df["PACE"] = df["POSS"] * 240 / df["MIN"].clip(lower=240)
     df["ORTG"] = 100 * df["PTS"] / df["POSS"]
     df["DRTG"] = 100 * df["OPP_PTS"] / df["POSS"]
+    for side, other in (("", "OPP_"), ("OPP_", "")):
+        df[side + "EFG_PCT"] = (df[side + "FGM"] + 0.5 * df[side + "FG3M"]) / df[side + "FGA"]
+        df[side + "TOV_PCT"] = df[side + "TOV"] / (df[side + "FGA"] + 0.44 * df[side + "FTA"] + df[side + "TOV"])
+        df[side + "ORB_PCT"] = df[side + "OREB"] / (df[side + "OREB"] + df[other + "DREB"])
+        df[side + "FT_RATE"] = df[side + "FTM"] / df[side + "FGA"]
     cols = ["GAME_ID", "GAME_DATE", "SEASON", "TEAM_ID", "TEAM_ABBREVIATION", "OPP_TEAM_ID",
-            "IS_HOME", "PLAYOFF", "PTS", "OPP_PTS", "PACE", "ORTG", "DRTG"]
+            "IS_HOME", "PLAYOFF", "PTS", "OPP_PTS", "PACE", "ORTG", "DRTG", *FACTORS, *OPP_FACTORS]
     df = df[cols].sort_values(["GAME_DATE", "GAME_ID", "TEAM_ID"]).reset_index(drop=True)
     return playoff_relative(df) if config.PLAYOFF_GAMES == "relative" else df
 
@@ -63,20 +77,18 @@ def playoff_relative(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def league_average(games: pd.DataFrame, date: pd.Timestamp, season: str) -> dict:
-    """League average pace and rating over this season and last, before the date."""
+    """League average pace, rating and four factors over this season and last, before the date.
+    (A team's offense and its opponent's defense are the same numbers, so one average serves both.)"""
     games = _rating_games(games)
     past = games[(games["GAME_DATE"] < date) & games["SEASON"].isin(_seasons_in_window(season))]
     current = past[past["SEASON"] == season]
     # Weight this season's games fully and last season's lightly, like team ratings do.
     w = np.where(past["SEASON"] == season, 1.0, config.PRIOR_SEASON_GAME_WEIGHT)
     if len(past) == 0:
-        return {"PACE": 99.0, "ORTG": 114.0}
+        return dict(_LEAGUE_START)
     if len(current) == 0:
         w = np.ones(len(past))
-    return {
-        "PACE": float(np.average(past["PACE"], weights=w)),
-        "ORTG": float(np.average(past["ORTG"], weights=w)),
-    }
+    return {k: float(np.average(past[k], weights=w)) for k in ("PACE", "ORTG", *FACTORS) if k in past}
 
 
 def _blend_history(seasons: np.ndarray, values: dict, season: str, league: dict) -> dict:
@@ -86,15 +98,16 @@ def _blend_history(seasons: np.ndarray, values: dict, season: str, league: dict)
     w = w * np.where(seasons == season, 1.0, config.PRIOR_SEASON_GAME_WEIGHT)
     shrink = config.SHRINK_GAMES
     total = w.sum() + shrink
-    prior = {"PACE": league["PACE"], "ORTG": league["ORTG"], "DRTG": league["ORTG"]}
+    # Defense is shrunk toward the same league average as offense (DRTG to ORTG, OPP_EFG_PCT to EFG_PCT).
+    prior = {k: league["ORTG"] if k == "DRTG" else league[k.removeprefix("OPP_")] for k in values}
     return {k: float((np.dot(w, v) + shrink * prior[k]) / total) for k, v in values.items()}
 
 
 def team_rating(games: pd.DataFrame, team_id: int, date: pd.Timestamp, season: str,
                 league: dict) -> dict:
-    """Recency-weighted pace, offensive and defensive rating for one team before a date.
-
-    Uses the opponent-adjusted columns when opponent_adjust added them."""
+    """Recency-weighted pace, offensive and defensive rating and four factors for one team
+    before a date. Uses the opponent-adjusted ratings when opponent_adjust added them; the
+    four factors are not opponent-adjusted."""
     games = _rating_games(games)
     past = games[
         (games["TEAM_ID"] == team_id)
@@ -104,7 +117,8 @@ def team_rating(games: pd.DataFrame, team_id: int, date: pd.Timestamp, season: s
     suffix = "_ADJ" if "ORTG_ADJ" in games else ""
     rating = _blend_history(
         past["SEASON"].to_numpy(),
-        {k: past[k + suffix].to_numpy() for k in ("PACE", "ORTG", "DRTG")},
+        {**{k: past[k + suffix].to_numpy() for k in ("PACE", "ORTG", "DRTG")},
+         **{k: past[k].to_numpy() for k in (*FACTORS, *OPP_FACTORS) if k in past}},
         season,
         league,
     )

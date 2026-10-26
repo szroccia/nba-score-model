@@ -52,7 +52,13 @@ PREDICTIONS_REMOTE = "dev"
 PREDICTIONS_BRANCH = "predictions"
 
 # Bump when feature calculations change, so cached features are rebuilt.
-FEATURE_VERSION = 5
+FEATURE_VERSION = 6
+
+# Four factors (shooting, turnovers, offensive rebounding, free throws) as extra regression
+# inputs next to the pace x efficiency formula. The inputs are always built; this only says
+# whether the regression uses them. Off until `evaluate --compare factors` settles it
+# (docs/decisions.md, decision 9).
+FOUR_FACTORS = False
 
 # Rest days are capped: 3+ days off is treated the same as 3.
 MAX_REST_DAYS = 3
@@ -73,6 +79,9 @@ SELECTION_METRICS = ["margin_mae", "total_mae", "abs_total_bias"]
 # a change counts only if it moves average error by more than this many standard errors,
 # measured month to month (docs/decisions.md, decision 8).
 NOISE_STANDARD_ERRORS = 2
+# From decision 9 on: a change that beats the noise is still turned down if it moves the
+# average total more than this many points further from the actual (decision 8's lesson).
+BIAS_GUARD_POINTS = 0.5
 # Ridge strengths tried for the complexity curve, and training sizes (team-games) for the learning curve.
 ALPHA_GRID = [0.01, 0.1, 1, 10, 100, 1000, 10000, 100000]
 LEARNING_CURVE_SIZES = [100, 250, 500, 1000, 2000, 4000]

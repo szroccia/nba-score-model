@@ -161,6 +161,7 @@ COMPARISONS = {
     "playoffs": ("PLAYOFF_GAMES", [("include", "playoffs include"), ("exclude", "playoffs exclude"),
                                    ("relative", "playoffs relative")], "Playoff games in ratings"),
     "sos": ("OPPONENT_ADJUST", [(False, "off"), (True, "on")], "Strength of schedule"),
+    "factors": ("FOUR_FACTORS", [(False, "off"), (True, "on")], "Four factors"),
 }
 
 
@@ -356,7 +357,7 @@ def predict_date(day: pd.Timestamp, use_injury_report: bool = True, refresh: boo
             for row, team, opp, pts in ((pair[0], g.HOME_TEAM, g.AWAY_TEAM, home_pts),
                                         (pair[1], g.AWAY_TEAM, g.HOME_TEAM, away_pts)):
                 details.append({"date": day.date().isoformat(), "game_id": g.GAME_ID, "team": team,
-                                "opponent": opp, **{f: row[f] for f in features.FEATURES},
+                                "opponent": opp, **{f: row[f] for f in fitted["coefficients"]},
                                 **model.contributions(fitted, row), "predicted_pts": pts,
                                 "missing": row["MISSING"]})
         rows.append({

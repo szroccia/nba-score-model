@@ -6,7 +6,7 @@ Settings are ranked by margin_mae, then total_mae, then abs_total_bias (fixed be
 
 ## Current settings
 
-Settings: alpha 10.0, feature_version 5, playoff_games include, half_life 12, prior_season_weight 0.4, shrink_games 4, opponent_adjust vs average team, replacement_obpm -1.5, replacement_dbpm -0.5, bpm_prior_minutes 500, minutes_half_life 5, rotation_minutes 20, max_rest_days 3, active_window_games 20, team_minutes 240.
+Settings: alpha 10.0, four_factors False, feature_version 6, playoff_games include, half_life 12, prior_season_weight 0.4, shrink_games 4, opponent_adjust vs average team, replacement_obpm -1.5, replacement_dbpm -0.5, bpm_prior_minutes 500, minutes_half_life 5, rotation_minutes 20, max_rest_days 3, active_window_games 20, team_minutes 240.
 
 | Model | Games | Margin MAE | Total MAE | Winner % | Total bias |
 | --- | --- | --- | --- | --- | --- |
@@ -67,3 +67,12 @@ Each fit uses only the most recent N team-games of history; scored on 2024-25 mo
 | 1000 | 10.89 | 10.93 | 1309 |
 | 2000 | 10.85 | 10.96 | 1309 |
 | 4000 | 10.86 | 10.83 | 1309 |
+
+## Four factors
+
+Same folds for each setting. Changes are in average error against the current setting (off) on the same games; noise is 2 standard errors, measured month to month. A change within the noise is a tie, and a tie keeps the simpler setting. October is the first month of each season, when ratings lean most on last season's games.
+
+| Setting | Games | Margin MAE | Total MAE | Winner % | Total bias | October total bias | Margin change | Margin noise | Total change | Total noise | Verdict |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| off | 2621 | 10.92 | 14.56 | 67.1% | -0.41 | -0.16 | - | - | - | - | current |
+| on | 2621 | 10.95 | 14.51 | 67.0% | -0.15 | +0.37 | +0.029 | 0.028 | -0.049 | 0.036 | worse |

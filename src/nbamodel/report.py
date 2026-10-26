@@ -25,6 +25,14 @@ POINT_EFFECTS = {
     "OPP_REST": "Per opponent rest day",
     "B2B": "On a back-to-back",
 }
+# Four-factor edges (only in a model trained with them): points per percentage point of edge,
+# beyond what the pace x efficiency formula already counts.
+FACTOR_EFFECTS = {
+    "EFG_EDGE": "Per point of shooting edge",
+    "TOV_EDGE": "Per point of turnover edge",
+    "ORB_EDGE": "Per point of rebounding edge",
+    "FT_EDGE": "Per point of free throw edge",
+}
 
 
 def _number(cell: str):
@@ -154,7 +162,8 @@ def coefficients(fitted: dict, out):
     coefs = fitted["coefficients"]
     _bars(axes[0], list(MULTIPLIERS.values()), [coefs[k] for k in MULTIPLIERS],
           "How much the model trusts each input", "Weight given by the regression", 1.0)
-    _bars(axes[1], list(POINT_EFFECTS.values()), [coefs[k] for k in POINT_EFFECTS],
+    effects = {**POINT_EFFECTS, **{k: v for k, v in FACTOR_EFFECTS.items() if k in coefs}}
+    _bars(axes[1], list(effects.values()), [coefs[k] for k in effects],
           "Effect on a team's points", "Points added to the team's score")
     _headline(fig, "What the model learned",
               f"Ridge regression coefficients, trained on {', '.join(fitted['seasons'])} "
@@ -288,7 +297,8 @@ def playoff_settings(table: pd.DataFrame, chosen: str, out):
 
 
 VERDICT_PHRASES = {"better": "beats the noise", "worse": "is worse beyond the noise",
-                   "tie": "is within the noise"}
+                   "tie": "is within the noise",
+                   "fails bias guard": "beats the noise but fails the bias guard"}
 
 
 def noise_test(table: pd.DataFrame, heading: str, out):
@@ -324,9 +334,9 @@ def noise_test(table: pd.DataFrame, heading: str, out):
     # ("Strength of schedule off is worse beyond the noise").
     judged = f" {others['Setting'].iloc[0]}" if len(others) == 1 else ""
     _headline(fig, f"{heading}{judged} {VERDICT_PHRASES.get(verdict, verdict)}",
-              f"Against the current setting ({current}) on the same {games:,} validation games. Gray bars are "
-              "the noise (2 standard errors, month to month); a bar crossing zero is a tie, and a tie keeps "
-              "the simpler model.")
+              f"Against the current setting ({current}) on the same {games:,} validation games. Margin error "
+              "decides; total error counts only if margin is a tie. Gray bars are the noise (2 standard errors, "
+              "month to month); a bar crossing zero is a tie, and a tie keeps the simpler model.")
     fig.subplots_adjust(left=0.17, right=0.95, top=0.7, bottom=0.2)
     return _save(fig, out)
 
@@ -377,10 +387,11 @@ def prediction_breakdown(details: pd.DataFrame, out):
     for ax, (_, r) in zip(axes, rows.iterrows()):
         _style(ax, f"{r['team']} {'vs' if r['IS_HOME'] else 'at'} {r['opponent']}: "
                    f"{r['predicted_pts']:.1f} points", grid_axis="x")
-        labels = list(model.STEPS) + ["Predicted points"]
+        steps = [s for s in model.STEPS if s in r.index and pd.notna(r[s])]  # "Four factors" only if used
+        labels = steps + ["Predicted points"]
         y = list(range(len(labels)))[::-1]
         running = 0.0
-        for i, step in enumerate(model.STEPS):
+        for i, step in enumerate(steps):
             v = float(r[step])
             if i == 0:
                 running = v
@@ -398,9 +409,9 @@ def prediction_breakdown(details: pd.DataFrame, out):
                     ha="center", fontsize=9, color=INK, fontweight="bold")
         ax.set_yticks(y, labels)
         ax.tick_params(axis="y", labelcolor=INK)
-        cum = float(r[model.STEPS[0]])
+        cum = float(r[steps[0]])
         reached.append(cum)
-        for step in model.STEPS[1:]:
+        for step in steps[1:]:
             cum += float(r[step])
             reached.append(cum)
         ax.set_xlabel("Points", fontsize=9, color=MUTED)
@@ -438,9 +449,9 @@ def run(fig_dir=None) -> list:
                                     fig_dir / "ridge_alpha.png"))
         if "Learning curve" in tables:
             made.append(learning_curve(tables["Learning curve"], fig_dir / "learning_curve.png"))
-        if "Strength of schedule" in tables:
-            made.append(noise_test(tables["Strength of schedule"], "Strength of schedule",
-                                   fig_dir / "strength_of_schedule.png"))
+        for heading, name in (("Strength of schedule", "strength_of_schedule"), ("Four factors", "four_factors")):
+            if heading in tables:
+                made.append(noise_test(tables[heading], heading, fig_dir / f"{name}.png"))
         if "Playoff games in ratings" in tables:
             made.append(playoff_settings(tables["Playoff games in ratings"], config.PLAYOFF_GAMES,
                                          fig_dir / "playoff_settings.png"))

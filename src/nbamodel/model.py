@@ -6,16 +6,17 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import Ridge
 
-from . import config
-from .features import FEATURES
+from . import config, features
+from .features import FACTOR_FEATURES
 
 
 def fit(train: pd.DataFrame, alpha: float | None = None) -> dict:
     alpha = config.RIDGE_ALPHA if alpha is None else alpha
-    ridge = Ridge(alpha=alpha).fit(train[FEATURES], train["PTS"])
+    names = features.inputs()
+    ridge = Ridge(alpha=alpha).fit(train[names], train["PTS"])
     return {
         "intercept": float(ridge.intercept_),
-        "coefficients": dict(zip(FEATURES, map(float, ridge.coef_))),
+        "coefficients": dict(zip(names, map(float, ridge.coef_))),
         "alpha": alpha,
         "trained_on_rows": int(len(train)),
         "seasons": sorted(train["SEASON"].unique().tolist()),
@@ -23,12 +24,15 @@ def fit(train: pd.DataFrame, alpha: float | None = None) -> dict:
 
 
 def predict(model: dict, X: pd.DataFrame) -> np.ndarray:
-    coef = np.array([model["coefficients"][f] for f in FEATURES])
-    return model["intercept"] + X[FEATURES].to_numpy() @ coef
+    """Uses the inputs the model was trained on, whatever the current settings."""
+    names = list(model["coefficients"])
+    coef = np.array([model["coefficients"][f] for f in names])
+    return model["intercept"] + X[names].to_numpy() @ coef
 
 
 # A prediction broken into the steps that add up to it, in plain words, in order.
-STEPS = ["Pace x efficiency formula", "Regression calibration", "Own lineup tonight",
+# "Four factors" appears only for a model trained with them.
+STEPS = ["Pace x efficiency formula", "Regression calibration", "Four factors", "Own lineup tonight",
          "Opponent's lineup tonight", "Home court", "Rest and back-to-backs"]
 
 
@@ -38,14 +42,19 @@ def contributions(model: dict, row: dict) -> dict:
     The formula enters at face value; "regression calibration" is the intercept plus the
     small correction from its coefficient not being exactly 1."""
     c = model["coefficients"]
-    return {
+    factors = [f for f in FACTOR_FEATURES if f in c]
+    steps = {
         STEPS[0]: row["BASE_PTS"],
         STEPS[1]: model["intercept"] + (c["BASE_PTS"] - 1) * row["BASE_PTS"],
-        STEPS[2]: c["LINEUP_OFF_PTS"] * row["LINEUP_OFF_PTS"],
-        STEPS[3]: c["LINEUP_DEF_PTS"] * row["LINEUP_DEF_PTS"],
-        STEPS[4]: c["IS_HOME"] * row["IS_HOME"],
-        STEPS[5]: sum(c[f] * row[f] for f in ("REST", "OPP_REST", "B2B", "OPP_B2B")),
+        STEPS[2]: sum(c[f] * row[f] for f in factors),
+        STEPS[3]: c["LINEUP_OFF_PTS"] * row["LINEUP_OFF_PTS"],
+        STEPS[4]: c["LINEUP_DEF_PTS"] * row["LINEUP_DEF_PTS"],
+        STEPS[5]: c["IS_HOME"] * row["IS_HOME"],
+        STEPS[6]: sum(c[f] * row[f] for f in ("REST", "OPP_REST", "B2B", "OPP_B2B")),
     }
+    if not factors:
+        del steps[STEPS[2]]
+    return steps
 
 
 def save(model: dict, path=config.MODEL_PATH) -> None:

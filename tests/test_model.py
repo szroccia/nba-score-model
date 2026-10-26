@@ -79,7 +79,8 @@ def _fake_league(seasons=("2023-24", "2024-25"), n_teams=4, seed=0):
                             "SEASON_ID": season, "TEAM_ID": team, "TEAM_ABBREVIATION": f"T{team}",
                             "GAME_ID": gid, "GAME_DATE": day,
                             "MATCHUP": f"T{team} vs. T{opp}" if home else f"T{team} @ T{opp}",
-                            "MIN": 240, "FGA": 88, "FTA": 22, "OREB": 10, "TOV": 14, "PTS": round(pts),
+                            "MIN": 240, "FGM": 41, "FG3M": 13, "FGA": 88, "FTM": 17, "FTA": 22, "OREB": 10,
+                            "DREB": 33, "TOV": 14, "PTS": round(pts),
                             "SEASON": season,
                         })
                         for p in range(8):
@@ -190,7 +191,8 @@ def test_opponent_adjustment_credits_tough_schedule(monkeypatch):
             for t, o, p, home in ((team, opp, pts, True), (opp, team, opp_pts, False)):
                 rows.append({"TEAM_ID": t, "TEAM_ABBREVIATION": f"T{t}", "GAME_ID": gid, "GAME_DATE": day,
                              "MATCHUP": f"T{t} vs. T{o}" if home else f"T{t} @ T{o}", "MIN": 240,
-                             "FGA": 88, "FTA": 22, "OREB": 10, "TOV": 14, "PTS": p, "SEASON": "2024-25"})
+                             "FGM": 41, "FG3M": 13, "FGA": 88, "FTM": 17, "FTA": 22, "OREB": 10, "DREB": 33,
+                             "TOV": 14, "PTS": p, "SEASON": "2024-25"})
     games = ratings.opponent_adjust(ratings.team_game_table(pd.DataFrame(rows)))
     end = day + pd.Timedelta(days=1)
     league = ratings.league_average(games, end, "2024-25")
@@ -226,6 +228,49 @@ def test_opponent_adjustment_ignores_league_wide_scoring_changes():
     adj = ratings.opponent_adjust(pd.DataFrame(rows)).query("SEASON == '2024-25'")
     raw_level = adj["ORTG"].mean() + adj["DRTG"].mean()
     assert abs(adj["ORTG_ADJ"].mean() + adj["DRTG_ADJ"].mean() - raw_level) < 0.5
+
+
+def test_four_factors_from_a_box_score():
+    """One game, worked by hand: each team's offense factors, and its defense = the other's offense."""
+    box = {"A": dict(FGM=40, FG3M=10, FGA=85, FTM=20, FTA=25, OREB=10, DREB=35, TOV=12, PTS=110),
+           "B": dict(FGM=38, FG3M=14, FGA=90, FTM=15, FTA=20, OREB=12, DREB=30, TOV=15, PTS=105)}
+    rows = [{"TEAM_ID": i, "TEAM_ABBREVIATION": t, "GAME_ID": 1, "GAME_DATE": pd.Timestamp("2024-11-01"),
+             "MATCHUP": "A vs. B" if t == "A" else "B @ A", "MIN": 240, "SEASON": "2024-25", **box[t]}
+            for i, t in ((1, "A"), (2, "B"))]
+    a = ratings.team_game_table(pd.DataFrame(rows)).set_index("TEAM_ID").loc[1]
+    assert a["EFG_PCT"] == pytest.approx((40 + 0.5 * 10) / 85)
+    assert a["TOV_PCT"] == pytest.approx(12 / (85 + 0.44 * 25 + 12))
+    assert a["ORB_PCT"] == pytest.approx(10 / (10 + 30))      # B's defensive rebounds
+    assert a["FT_RATE"] == pytest.approx(20 / 85)
+    assert a["OPP_EFG_PCT"] == pytest.approx((38 + 0.5 * 14) / 90)
+    assert a["OPP_ORB_PCT"] == pytest.approx(12 / (12 + 35))  # A's defensive rebounds
+
+
+def test_four_factor_edges_are_built_but_used_only_when_on(monkeypatch):
+    from nbamodel import config
+
+    team_games, player_games = _fake_league()
+    games = ratings.team_game_table(team_games)
+    day = games["GAME_DATE"].max()
+    league = ratings.league_average(games, day, "2024-25")
+    impact = pd.DataFrame(columns=["OBPM", "DBPM"])
+    rows = features.matchup_rows(games, player_games, impact, day, "2024-25", 1, 2, {}, {}, league)
+    # Every fake team has the same box score, so no team has an edge in any factor.
+    for name in features.FACTOR_FEATURES:
+        assert rows[0][name] == pytest.approx(0, abs=1e-6)
+
+    feats = _fake_features()
+    rng = np.random.default_rng(3)
+    for name in features.FACTOR_FEATURES:
+        feats[name] = rng.normal(0, 2, len(feats))
+    monkeypatch.setattr(config, "FOUR_FACTORS", False)
+    assert "EFG_EDGE" not in model.fit(feats)["coefficients"]
+    monkeypatch.setattr(config, "FOUR_FACTORS", True)
+    fitted = model.fit(feats)
+    assert list(fitted["coefficients"])[-4:] == list(features.FACTOR_FEATURES)
+    # A saved model predicts with the inputs it was trained on, whatever the setting is now.
+    monkeypatch.setattr(config, "FOUR_FACTORS", False)
+    assert len(model.predict(fitted, feats.head(3))) == 3
 
 
 def test_validate_flags_bad_box_scores(monkeypatch):
@@ -269,9 +314,17 @@ def test_contributions_add_up_to_the_prediction():
     row = {"BASE_PTS": 113.0, "LINEUP_OFF_PTS": -2.0, "LINEUP_DEF_PTS": 1.0, "IS_HOME": 1,
            "REST": 2, "OPP_REST": 0, "B2B": 0, "OPP_B2B": 1}
     parts = model.contributions(fitted, row)
-    assert list(parts) == model.STEPS
+    assert list(parts) == [s for s in model.STEPS if s != "Four factors"]  # a model without them
     assert sum(parts.values()) == pytest.approx(model.predict(fitted, pd.DataFrame([row]))[0])
     assert parts["Home court"] == pytest.approx(2.1)
+
+    # With the four factors, their step holds the edges times their weights, and it still adds up.
+    fitted["coefficients"].update({"EFG_EDGE": -0.3, "TOV_EDGE": 0.2, "ORB_EDGE": 0.1, "FT_EDGE": 0.0})
+    row.update({"EFG_EDGE": 2.0, "TOV_EDGE": -1.0, "ORB_EDGE": 3.0, "FT_EDGE": 1.0})
+    parts = model.contributions(fitted, row)
+    assert list(parts) == model.STEPS
+    assert parts["Four factors"] == pytest.approx(-0.6 - 0.2 + 0.3)
+    assert sum(parts.values()) == pytest.approx(model.predict(fitted, pd.DataFrame([row]))[0])
 
 
 def test_healthy_team_with_deep_bench_has_no_lineup_change():
@@ -625,6 +678,9 @@ def test_noise_test_needs_a_change_bigger_than_the_noise():
     # Worse on total error, with no margin change: worse.
     worse = base.assign(PRED_TOTAL=220.0 + np.sign(base["PRED_TOTAL"] - 220) * ((base["PRED_TOTAL"] - 220).abs() + 3))
     assert evaluate.noise_test(base, worse)["verdict"] == "worse"
+    # Better on margin, but totals now run a point high on average: fails the bias guard.
+    biased = better.assign(PRED_TOTAL=better["PRED_TOTAL"] + 1.0)
+    assert evaluate.noise_test(base, biased)["verdict"] == "fails bias guard"
 
 
 def test_evaluate_compares_strength_of_schedule(monkeypatch, tmp_path):
@@ -650,3 +706,30 @@ def test_evaluate_compares_strength_of_schedule(monkeypatch, tmp_path):
     assert sos.loc[1, "Margin change"] < 0
     assert (tmp_path / "docs" / "figures" / "strength_of_schedule.png").exists()
     assert config.OPPONENT_ADJUST is False  # restored after the comparison
+
+
+def test_evaluate_compares_four_factors(monkeypatch, tmp_path):
+    from nbamodel import cli, config
+
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "FOUR_FACTORS", False)
+    monkeypatch.setattr(config, "VALIDATION_SEASONS", ["2023-24", "2024-25"])
+    monkeypatch.setattr(config, "TEST_SEASON", "2025-26")
+    monkeypatch.setattr(config, "ALPHA_GRID", [1, 100])
+    monkeypatch.setattr(config, "LEARNING_CURVE_SIZES", [100, 400])
+    monkeypatch.setattr(config, "MODEL_PATH", tmp_path / "missing.json")
+    feats = _fake_features()
+    rng = np.random.default_rng(4)
+    for name in ("TOV_EDGE", "ORB_EDGE", "FT_EDGE"):
+        feats[name] = rng.normal(0, 2, len(feats))
+    # The shooting edge carries real information about points that the formula misses.
+    feats["EFG_EDGE"] = rng.normal(0, 2, len(feats))
+    feats["PTS"] = feats["PTS"] + 1.5 * feats["EFG_EDGE"]
+    monkeypatch.setattr(cli, "_historical", lambda seasons: feats)  # same features either way
+    monkeypatch.setattr(cli, "_vegas_lines", lambda: None)
+    cli.main(["evaluate", "--compare", "factors"])
+    tables = __import__("nbamodel.report", fromlist=["read_tables"]).read_tables(tmp_path / "results" / "evaluation.md")
+    table = tables["Four factors"]
+    assert table["Verdict"].tolist() == ["current", "better"]
+    assert (tmp_path / "docs" / "figures" / "four_factors.png").exists()
+    assert config.FOUR_FACTORS is False

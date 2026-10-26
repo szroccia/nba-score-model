@@ -101,6 +101,7 @@ Each is explained with its evidence in the [decision log](docs/decisions.md):
 - [Rolling monthly evaluation with a locked test season](docs/decisions.md#5-evaluation-design)
 - [Playoff games kept in ratings](docs/decisions.md#6-playoff-games-in-ratings) and [ridge alpha 10](docs/decisions.md#7-ridge-strength)
 - [Strength-of-schedule adjustment](docs/decisions.md#8-strength-of-schedule), kept because it beat a noise test fixed in advance
+- [Four factors](docs/decisions.md#9-four-factors), tested and left out: they helped totals but hurt margins
 
 ## Data
 
