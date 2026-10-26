@@ -356,13 +356,13 @@ def predict_date(day: pd.Timestamp, use_injury_report: bool = True, refresh: boo
         if details is not None:
             for row, team, opp, pts in ((pair[0], g.HOME_TEAM, g.AWAY_TEAM, home_pts),
                                         (pair[1], g.AWAY_TEAM, g.HOME_TEAM, away_pts)):
-                details.append({"date": day.date().isoformat(), "game_id": g.GAME_ID, "team": team,
+                details.append({"date": day.date().isoformat(), "game_id": _game_id(g.GAME_ID), "team": team,
                                 "opponent": opp, **{f: row[f] for f in fitted["coefficients"]},
                                 **model.contributions(fitted, row), "predicted_pts": pts,
                                 "missing": row["MISSING"]})
         rows.append({
             "date": day.date().isoformat(),
-            "game_id": g.GAME_ID,
+            "game_id": _game_id(g.GAME_ID),
             "away": g.AWAY_TEAM,
             "home": g.HOME_TEAM,
             "away_pts": round(away_pts, 1),
@@ -374,8 +374,50 @@ def predict_date(day: pd.Timestamp, use_injury_report: bool = True, refresh: boo
             "home_missing": pair[0]["MISSING"],
             "away_missing": pair[1]["MISSING"],
             "injury_report": source,
+            "tip_off": g.GAME_TIME_UTC,
         })
     return pd.DataFrame(rows)
+
+
+def _game_id(game_id) -> str:
+    """The official 10-digit id, e.g. '0022600119'. Read back from a CSV it loses its leading zeros."""
+    return str(game_id).zfill(10)
+
+
+def _read_predictions(path) -> pd.DataFrame:
+    df = pd.read_csv(path, dtype={"game_id": str})
+    df["game_id"] = df["game_id"].map(_game_id)
+    return df
+
+
+def _started(preds: pd.DataFrame, now: pd.Timestamp) -> list:
+    """Ids of the games whose scheduled tip-off is at or before now."""
+    tip_off = pd.to_datetime(preds["tip_off"], utc=True, errors="coerce")
+    return preds.loc[tip_off <= now, "game_id"].tolist()
+
+
+def _matchups(preds: pd.DataFrame, game_ids: list) -> str:
+    rows = preds[preds["game_id"].isin(game_ids)]
+    return ", ".join(f"{r.away} @ {r.home}" for r in rows.itertuples())
+
+
+def keep_started(old: pd.DataFrame, new: pd.DataFrame, now: pd.Timestamp,
+                 frozen: list | None = None) -> tuple[pd.DataFrame, list]:
+    """Put back the earlier rows for games that had tipped off by now, so a later run never
+    rewrites a prediction once its game is under way. Also works on the per-team details
+    rows when given the frozen game ids. Returns the rows and the frozen ids."""
+    if frozen is None:
+        frozen = [g for g in _started(new, now) if g in set(old["game_id"])]
+    if not frozen:
+        return new, []
+    out = pd.concat([new[~new["game_id"].isin(frozen)], old[old["game_id"].isin(frozen)]], ignore_index=True)
+    # Back in the new run's order. Files saved before tip_off was added get it from the new run.
+    order = {g: i for i, g in enumerate(dict.fromkeys(new["game_id"]))}
+    out = out.sort_values("game_id", key=lambda ids: ids.map(order), kind="stable").reset_index(drop=True)
+    out = out.reindex(columns=new.columns)
+    if "tip_off" in new:
+        out["tip_off"] = out["game_id"].map(new.set_index("game_id")["tip_off"])
+    return out, frozen
 
 
 def _log_changes(old: pd.DataFrame, new: pd.DataFrame, day: str) -> None:
@@ -395,19 +437,33 @@ def _log_changes(old: pd.DataFrame, new: pd.DataFrame, day: str) -> None:
         print("\n".join(lines))
 
 
-def cmd_predict(args, refresh: bool = False):
+def cmd_predict(args, refresh: bool = False, now: pd.Timestamp | None = None):
     day = pd.Timestamp(args.date or date_cls.today().isoformat())
     details = []
     preds = predict_date(day, use_injury_report=not args.no_injury_report, refresh=refresh, details=details)
     if preds.empty:
         return
+    now = pd.Timestamp.now(tz="UTC") if now is None else now
+    preds["predicted_at"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    details = pd.DataFrame(details)
     config.PREDICTIONS_DIR.mkdir(exist_ok=True)
     path = config.PREDICTIONS_DIR / f"{day.date()}.csv"
+    details_path = config.PREDICTIONS_DIR / f"{day.date()}_details.csv"
+    started = _started(preds, now)
     if path.exists():
-        _log_changes(pd.read_csv(path), preds, str(day.date()))
+        old = _read_predictions(path)
+        preds, frozen = keep_started(old, preds, now)
+        if frozen and details_path.exists():
+            details = keep_started(_read_predictions(details_path), details, now, frozen)[0]
+        if frozen:
+            print("Kept the earlier prediction for games already under way: " + _matchups(preds, frozen))
+        started = [g for g in started if g not in frozen]
+        _log_changes(old, preds, str(day.date()))
+    if started:
+        print("Note: these games had already tipped off before their first prediction: " + _matchups(preds, started))
     try:
         preds.to_csv(path, index=False)
-        pd.DataFrame(details).round(3).to_csv(config.PREDICTIONS_DIR / f"{day.date()}_details.csv", index=False)
+        details.round(3).to_csv(details_path, index=False)
     except PermissionError:
         print(f"Could not save {path}: it is probably open in Excel. Close it and run again.")
         return

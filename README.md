@@ -162,7 +162,7 @@ powershell -ExecutionPolicy Bypass -File schedule_daily.ps1
 
 It adds a Task Scheduler task, "NBA daily predictions", that runs `run_daily.bat` at 11:00 and 18:00 and appends each run's output to `daily.log`. A console window shows while it runs. The computer needs to be on or asleep (the task wakes it) and you need to be signed in; a missed run is harmless, because the next one catches up on every game since. To test it now, run `schtasks /run /tn "NBA daily predictions"` (in Git Bash, `schtasks //run //tn "NBA daily predictions"`) and check `daily.log` a few minutes later. To remove it, `schtasks /delete /tn "NBA daily predictions" /f`.
 
-When a later run changes a prediction by a point or more, the change and the players behind it are added to `predictions/<date>_changes.md`.
+When a later run changes a prediction by a point or more, the change and the players behind it are added to `predictions/<date>_changes.md`. A later run never changes a game that has already tipped off: it keeps the earlier prediction, so every saved prediction was made before its game started.
 
 ## Output
 
@@ -174,6 +174,7 @@ When a later run changes a prediction by a point or more, the change and the pla
 | `home_margin`, `total` | Home points minus away points, and combined points |
 | `home_lineup_pts`, `away_lineup_pts` | How much tonight's lineups moved that team's margin |
 | `home_missing`, `away_missing` | Rotation players with less than a 100% chance of playing |
+| `tip_off`, `predicted_at` | Scheduled tip-off and when the prediction was made, both in UTC |
 
 `predictions/<date>_details.csv` has one row per team with every input and the points each step adds, which is what `explain` draws.
 

@@ -159,8 +159,8 @@ def test_predict_date_with_fake_data(monkeypatch, tmp_path):
     monkeypatch.setattr(data, "bpm", lambda s, refresh=False: pd.DataFrame(
         {"Player": ["Player BA"], "MP": [2000], "OBPM": [5.0], "DBPM": [1.0], "BPM": [6.0]}))
     monkeypatch.setattr(data, "schedule", lambda s, refresh=False: pd.DataFrame({
-        "GAME_ID": [999], "GAME_DATE": [day], "HOME_TEAM_ID": [1], "HOME_TEAM": ["T1"],
-        "AWAY_TEAM_ID": [4], "AWAY_TEAM": ["T4"]}))
+        "GAME_ID": [999], "GAME_DATE": [day], "GAME_TIME_UTC": ["2025-01-16T00:30:00Z"], "HOME_TEAM_ID": [1],
+        "HOME_TEAM": ["T1"], "AWAY_TEAM_ID": [4], "AWAY_TEAM": ["T4"]}))
     # Team 1 traded Player BB to team 4 for Player EH.
     roster = player_games[["TEAM_ID", "PLAYER_ID"]].drop_duplicates()
     roster.loc[roster["PLAYER_ID"] == 111, "TEAM_ID"] = 4
@@ -176,6 +176,7 @@ def test_predict_date_with_fake_data(monkeypatch, tmp_path):
     assert 90 < row["home_pts"] < 140 and 90 < row["away_pts"] < 140
     assert "Player BA" in row["home_missing"]
     assert row["home_lineup_pts"] < 0
+    assert row["game_id"] == "0000000999" and row["tip_off"] == "2025-01-16T00:30:00Z"
 
 
 def test_roster_moves_count_departures_and_newcomers():
@@ -751,3 +752,40 @@ def test_evaluate_compares_four_factors(monkeypatch, tmp_path):
     assert table["Verdict"].tolist() == ["current", "better"]
     assert (tmp_path / "docs" / "figures" / "four_factors.png").exists()
     assert config.FOUR_FACTORS is False
+
+
+def test_later_run_keeps_predictions_for_games_already_started(monkeypatch, tmp_path):
+    """The 6 PM run must not rewrite a game that tipped off at 3:30 PM, and reading the
+    morning's file back (ids without their leading zeros) must not break the run."""
+    from argparse import Namespace
+    from nbamodel import cli, config
+
+    monkeypatch.setattr(config, "PREDICTIONS_DIR", tmp_path)
+
+    def fake_predict(home_pts):
+        def predict_date(day, use_injury_report=True, refresh=False, details=None):
+            rows = []
+            for game_id, away, home, tip_off, pts in (("0022600119", "WAS", "CHA", "2026-10-26T19:30:00Z", home_pts),
+                                                      ("0022600120", "MIN", "CLE", "2026-10-26T23:00:00Z", home_pts)):
+                rows.append({"date": "2026-10-26", "game_id": game_id, "away": away, "home": home, "away_pts": 110.0,
+                             "home_pts": pts, "home_margin": pts - 110, "total": pts + 110,
+                             "home_missing": "", "away_missing": "", "tip_off": tip_off})
+                details.extend({"game_id": game_id, "team": t, "predicted_pts": p} for t, p in ((home, pts), (away, 110.0)))
+            return pd.DataFrame(rows)
+        return predict_date
+
+    args = Namespace(date="2026-10-26", no_injury_report=True, push=False)
+    monkeypatch.setattr(cli, "predict_date", fake_predict(112.0))
+    cli.cmd_predict(args, now=pd.Timestamp("2026-10-26T15:00:00Z"))      # 11 AM Eastern
+    monkeypatch.setattr(cli, "predict_date", fake_predict(118.0))
+    cli.cmd_predict(args, now=pd.Timestamp("2026-10-26T22:00:00Z"))      # 6 PM Eastern
+
+    saved = pd.read_csv(tmp_path / "2026-10-26.csv", dtype={"game_id": str})
+    assert saved["game_id"].tolist() == ["0022600119", "0022600120"]
+    assert saved["home_pts"].tolist() == [112.0, 118.0]                   # early game kept, late game updated
+    assert saved["predicted_at"].tolist() == ["2026-10-26T15:00:00Z", "2026-10-26T22:00:00Z"]
+    details = pd.read_csv(tmp_path / "2026-10-26_details.csv", dtype={"game_id": str})
+    assert details["predicted_pts"].tolist() == [112.0, 110.0, 118.0, 110.0]
+    changes = (tmp_path / "2026-10-26_changes.md").read_text()
+    assert "MIN @ CLE" in changes and "WAS @ CHA" not in changes
+
