@@ -17,8 +17,12 @@ from .names import normalize_name
 
 REPORT_URL = "https://ak-static.cms.nba.com/referee/injury/Injury-Report_{stamp}.pdf"
 STATUSES = ["Out", "Doubtful", "Questionable", "Probable", "Available"]
+# Names are 'Last, First'. A few last names start in lower case ('da Silva, Tristan') and a
+# few have the suffix after its own comma ('Udeh, Jr., Ernest'; most are 'Jackson Jr., Jaren').
 _PLAYER_RE = re.compile(
-    r"(?P<name>[A-Z][\w.'\- ]*?, [A-Z][\w.'\- ]*?)\s+(?P<status>" + "|".join(STATUSES) + r")\b\s*(?P<reason>.*)"
+    r"(?P<name>(?:\b(?:da|de|di|del|der|van|von|le|la|du|dos) )?[A-Z][\w.'\- ]*?"
+    r"(?:, (?:Jr|Sr|II|III|IV|V)\.?)?, [A-Z][\w.'\- ]*?)"
+    r"\s+(?P<status>" + "|".join(STATUSES) + r")\b\s*(?P<reason>.*)"
 )
 # Each game's first row starts with its date and tip-off time, e.g. '10/21/2026 07:30 (ET)'.
 _DATE_RE = re.compile(r"(\d{2}/\d{2}/\d{4})\s+\d{1,2}:\d{2}\s*\(ET\)")

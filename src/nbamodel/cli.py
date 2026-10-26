@@ -252,7 +252,7 @@ def _warn_unmatched(statuses: pd.DataFrame, players: pd.DataFrame, teams: set) -
     unmatched = [p for p in listed["PLAYER"] if normalize_name(p) not in known]
     if unmatched:
         print(f"Note: {len(unmatched)} listed players not found in box scores (rookies or name mismatches): "
-              + ", ".join(unmatched[:10]))
+              + "; ".join(unmatched[:10]))
 
 
 def _warn_unreported(parsed: pd.DataFrame, on_day: pd.DataFrame, playing: set, day: pd.Timestamp) -> None:

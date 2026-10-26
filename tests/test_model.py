@@ -36,6 +36,24 @@ def test_parse_injury_report_text():
     assert "LAC" not in probs
 
 
+def test_injury_report_reads_unusual_names():
+    """'da Silva' starts in lower case and 'Udeh, Jr.' has an extra comma. Both once lost part of the name."""
+    names = {"Orlando Magic": "ORL", "Minnesota Timberwolves": "MIN"}
+    text = "\n".join([
+        "10/26/2026 07:00 (ET) MIN@ORL Minnesota Timberwolves Udeh, Jr., Ernest Out G League - Two-Way",
+        "Orlando Magic da Silva, Tristan Questionable Injury/Illness - Left Ankle Sprain",
+        "Jackson Jr., Jaren Out Injury/Illness - Left Knee; Soreness",
+        "Lively II, Dereck Doubtful Injury/Illness - Right Foot Surgery",
+    ])
+    df = injuries.parse_report_text(text, names)
+    assert df["PLAYER"].tolist() == ["Udeh, Jr., Ernest", "da Silva, Tristan", "Jackson Jr., Jaren", "Lively II, Dereck"]
+    assert [normalize_name(p) for p in df["PLAYER"]] == [
+        normalize_name("Ernest Udeh Jr."), normalize_name("Tristan da Silva"),
+        normalize_name("Jaren Jackson Jr."), normalize_name("Dereck Lively II"),
+    ]
+    assert df["STATUS"].tolist() == ["out", "questionable", "out", "doubtful"]
+
+
 def test_injury_report_uses_only_the_day_predicted():
     """A report covers two days. A team on a back-to-back must get tonight's status, not tomorrow's."""
     names = {"Boston Celtics": "BOS", "Detroit Pistons": "DET", "Los Angeles Lakers": "LAL"}
