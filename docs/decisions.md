@@ -15,6 +15,7 @@ The major modeling choices, what was considered, the evidence and the reason for
 | 7 | [Ridge strength](#7-ridge-strength) | alpha = 10 | All reasonable values tie; ties go to the simpler model |
 | 8 | [Strength of schedule](#8-strength-of-schedule) | Adjust for opponents | Beat the noise on margin error, after a fix for a flaw that biased totals |
 | 9 | [Four factors](#9-four-factors) | Left out | Worse on margin error beyond the noise, though better on totals |
+| 10 | [Hand-picked settings](#10-hand-picked-settings) | Rating half-life 24, minutes half-life 12, replacement level -3; five others kept | Beat the noise on margin error; total error rose 0.11 |
 
 ---
 
@@ -76,11 +77,11 @@ In October, team ratings are mostly last season's games, so this is what account
 - **A rule fixed in advance:** settings are ranked by margin error, then total error, then total bias nearest zero, with near-ties going to the simpler model. From decision 8 on, "near tie" has a measured meaning: a change within the noise (see [decision 8](#8-strength-of-schedule)).
 - **A real bar to beat:** the closing line is the best public forecast.
 
-**Evidence.** On 2,620 validation games the model (as of decision 8) is within a third of a point of Vegas:
+**Evidence.** On 2,620 validation games the model (as of decision 10) trails Vegas by about a quarter of a point on margin error and half a point on total error:
 
 | | Margin error | Total error | Winners picked |
 | --- | --- | --- | --- |
-| Model | 10.92 | 14.55 | 67.1% |
+| Model | 10.85 | 14.66 | 67.6% |
 | Vegas closing line | 10.62 | 14.15 | 68.7% |
 
 ![Model vs Vegas by month](figures/vegas_by_month.png)
@@ -196,4 +197,61 @@ Each is tracked for a team's offense and for its defense (what opponents did aga
 - The code stays, switched off (`FOUR_FACTORS = False`), so the factors can be tried again later without rebuilding anything.
 
 ![Four factors](figures/four_factors.png)
+
+---
+
+## 10. Hand-picked settings
+
+**Question.** Eight numbers in `config.py` were set by judgment when the model was built, not by evidence. Would other values predict better?
+
+| # | Setting | What it controls | In use | Values tried |
+| --- | --- | --- | --- | --- |
+| 1 | Rating half-life (`RATING_HALF_LIFE_GAMES`) | How many games until an old game counts half as much in a team's ratings | 12 | 6, 9, 12, 18, 24 |
+| 2 | Last season's games (`PRIOR_SEASON_GAME_WEIGHT`) | How much last season's games count once a new season starts | 0.4 | 0.2, 0.4, 0.6, 0.8 |
+| 3 | Rating shrinkage (`SHRINK_GAMES`) | Games of league-average play added to every team rating, so a few games can't swing it | 4 | 0, 2, 4, 8 |
+| 4 | Minutes half-life (`MINUTES_HALF_LIFE_GAMES`) | How many games until a player's old minutes count half as much | 5 | 2, 3, 5, 8, 12 |
+| 5 | Rotation player cutoff (`ROTATION_MINUTES`) | Minutes a player usually plays, when he plays, to be expected at those minutes when back from a rest or injury | 20 | 12, 16, 20, 24 |
+| 6 | Replacement level (`REPLACEMENT_OBPM`, `REPLACEMENT_DBPM`) | BPM for players with no record, offense + defense, split 3 to 1 | -2 | -1, -2, -3 |
+| 7 | BPM shrinkage (`BPM_PRIOR_MINUTES`) | How hard players with few minutes last season are pulled toward replacement level. At 500, a player with 250 minutes gets half his own BPM and half replacement level | 500 | 250, 500, 1000, 2000 |
+| 8 | Rest days cap (`MAX_REST_DAYS`) | Rest beyond this many days counts the same | 3 | 2, 3, 5 |
+
+**What this test can't check.**
+- `PLAY_PROBABILITY`, the chance a player plays given his injury report status (for example 50% for Questionable). Past injury reports aren't kept, so validation uses who actually played and never needs these numbers. They stay a judgment call.
+- Part of `BPM_PRIOR_MINUTES`: during a season it also sets how fast this season's BPM takes over from last season's. To avoid looking ahead, validation uses only last season's BPM, so only the pull toward replacement level is tested.
+
+**Test fixed in advance,** written down before any results existed (October 26, 2026). `python -m nbamodel tune` runs it and writes [results/tuning.md](../results/tuning.md):
+
+1. Check the settings one at a time, in the order of the table. The team rating settings go first because they shape the biggest input, the pace x efficiency formula.
+2. Score every value on the same validation months as the value in use, with the noise test from decisions 8 and 9. Margin error decides first, then total error, and a change must exceed 2 standard errors, measured month to month. The bias guard applies: no value that moves the average total more than 0.5 points further from the actual.
+3. A value replaces the one in use only if it is better beyond the noise. If several are, the lowest margin error wins (then total error, then bias). Otherwise the value in use stays. None of these values is simpler than another, so without evidence there's no reason to move.
+4. Later settings are checked with the earlier winners in place. There is one pass only, so the number of comparisons is fixed at 24.
+5. **Luck.** Each comparison has about a 1 in 20 chance of beating the noise by luck alone, so across 24 of them about one could, even if no setting truly mattered. That's why the locked test season, scored once at the end, has the last word on whether tuning helped.
+6. If a winner sits at the end of its range, the write-up says so. Trying values beyond it would be a new test.
+
+*Fix during the first run (October 27, 2026).* The run stopped at a shrinkage of 0. Before a team's first game there was nothing to average, so the rating came out empty and the regression refused it. Now a team with no games is rated at the league average, which is what any shrinkage above 0 already does. Nothing changes for other values, and no results had been seen. The test is otherwise unchanged.
+
+**Result (October 28, 2026).** Full tables are in [results/tuning.md](../results/tuning.md). Three settings beat the noise:
+
+| Setting | Was | Test picked | Margin change | Noise | Total change | Noise |
+| --- | --- | --- | --- | --- | --- | --- |
+| Rating half-life | 12 | 24 | -0.037 | 0.026 | +0.130 | 0.104 |
+| Minutes half-life | 5 | 12 | -0.026 | 0.014 | -0.018 | 0.017 |
+| Replacement level | -2 | -3 | -0.009 | 0.009 | +0.003 | 0.003 |
+
+The other five (last season's games, rating shrinkage, rotation cutoff, BPM shrinkage and the rest cap) tied, so they keep their values. Before and after, on the same 2,621 validation games:
+
+| | Margin MAE | Total MAE | Winner % | Total bias |
+| --- | --- | --- | --- | --- |
+| Before | 10.92 | 14.56 | 67.1% | -0.41 |
+| After | 10.85 | 14.67 | 67.5% | +0.08 |
+
+**Choice (Steve, October 28, 2026): apply all three,** as the rule fixed in advance says.
+- **Rating half-life 24.** Team ratings now remember twice as far back. Longer memory makes them steadier and better at telling which team is stronger (margin), but probably slower to follow changes in how much teams score, which is where the cost shows: total error rose 0.13, beyond its noise. A half-life of 18 also beat the noise, at a smaller cost to totals (+0.069), but the rule takes the lowest margin error.
+- **Minutes half-life 12.** A player's expected minutes now draw on about his last dozen games instead of five, so one short or long night moves them less. This helped both margin and total.
+- **Replacement level -3.** A player with no BPM record is assumed to be a little worse. This won by a hair.
+- **Margin decides first.** It's the same rule that left the four factors out in decision 9, where totals improved and margin got worse. Twice now, margin and total have pulled in different directions. That suggests a separate model for totals might be worth its own test.
+- **Ends of the ranges.** All three winners sit at the end of the values tried, so values further out might do better still. Trying them would be a new test, with its own luck.
+- **Luck.** With 24 comparisons, about one could win by luck (point 5). The smallest win, replacement level, is the likeliest. The locked test season has the last word.
+
+![Tuning the hand-picked settings](figures/tuning.png)
 

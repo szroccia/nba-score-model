@@ -341,6 +341,60 @@ def noise_test(table: pd.DataFrame, heading: str, out):
     return _save(fig, out)
 
 
+def _label(value) -> str:
+    """A table cell back as the label it was written as: 12.0 -> '12', 0.2 -> '0.2'."""
+    return f"{value:g}" if isinstance(value, float) else str(value)
+
+
+def tuning(tables: dict, out):
+    """Decision 10: one panel per hand-picked setting, in the order tested. Each value's change in
+    margin error against the value in use at that step, with the noise. All panels share one
+    scale, so a big effect looks big and a small one small."""
+    plt = _plt()
+    summary = tables["Summary"].set_index("Setting")["Test picked"]
+    panels = [(h, t) for h, t in tables.items() if h != "Summary" and "Value" in t]
+    cols = 4
+    rows = -(-len(panels) // cols)
+    height = 2.9 * rows + 1.6
+    fig, axes = plt.subplots(rows, cols, figsize=(11, height), facecolor=SURFACE, sharey=True, squeeze=False)
+    reach = 0.05
+    changed = 0
+    for ax, (heading, table) in zip(axes.flat, panels):
+        name, _, unit = heading.partition(" (")
+        _style(ax, name)
+        labels = [_label(v) for v in table["Value"]]
+        current = labels[table["Verdict"].tolist().index("current")]
+        picked = _label(summary.get(name, current))
+        changed += picked != current
+        for x, (label, (_, r)) in enumerate(zip(labels, table.iterrows())):
+            if label == current:
+                ax.scatter([x], [0], s=90, facecolor=SURFACE, edgecolor=INK, linewidth=2, zorder=3)
+                continue
+            change, noise = float(r["Margin change"]), float(r["Margin noise"])
+            reach = max(reach, abs(change) + noise)
+            ax.plot([x, x], [change - noise, change + noise], color=GRAY, linewidth=6, solid_capstyle="butt")
+            ax.scatter([x], [change], s=70, color=ORANGE if label == picked else BLUE,
+                       edgecolor=SURFACE, linewidth=2, zorder=3)
+        ax.axhline(0, color=MUTED, linewidth=1)
+        ax.set_xticks(range(len(labels)), labels)
+        ax.set_xlim(-0.6, len(labels) - 0.4)
+        ax.set_xlabel(unit.rstrip(")"), fontsize=9, color=MUTED)
+    for ax in list(axes.flat)[len(panels):]:
+        ax.set_visible(False)
+    axes[0][0].set_ylim(-reach * 1.25, reach * 1.25)
+    for row in axes:
+        row[0].set_ylabel("Change in margin error, points", fontsize=9, color=MUTED)
+    title = (f"{changed} of {len(panels)} hand-picked settings beat the noise" if changed
+             else "None of the hand-picked settings beat the noise")
+    _headline(fig, title,
+              "Each value against the value in use (open circle) on the same validation games; below zero is "
+              "better. Gray bars are the noise (2 standard errors, month to month): a bar crossing zero is a tie, "
+              "which keeps the value in use. Orange marks a value the test picked. Settings were tested in "
+              "reading order, each with the earlier winners in place.")
+    fig.subplots_adjust(left=0.07, right=0.98, top=1 - 1.75 / height, bottom=0.1, hspace=0.75, wspace=0.12)
+    return _save(fig, out)
+
+
 def cv_scheme(out):
     """How evaluation splits time: rolling monthly folds on validation seasons, test season locked."""
     plt = _plt()
@@ -440,6 +494,8 @@ def run(fig_dir=None) -> list:
     if (results / "backtest.md").exists():
         made.append(model_vs_formula(read_backtest(), fig_dir / "model_vs_formula.png"))
     made.append(cv_scheme(fig_dir / "evaluation_scheme.png"))
+    if (results / "tuning.md").exists():
+        made.append(tuning(read_tables(results / "tuning.md"), fig_dir / "tuning.png"))
     if (results / "evaluation.md").exists():
         tables = read_tables(results / "evaluation.md")
         if "Against the Vegas closing line" in tables:

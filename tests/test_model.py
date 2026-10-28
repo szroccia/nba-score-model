@@ -635,6 +635,41 @@ def test_saved_features_rebuild_when_a_setting_changes(monkeypatch, tmp_path):
     assert builds == [4, 8]
 
 
+def test_saved_features_with_gaps_are_rebuilt(monkeypatch, tmp_path):
+    from nbamodel import cli, config
+
+    builds = []
+
+    def build(games, players, impact, seasons):
+        builds.append(len(builds))
+        return pd.DataFrame({"SEASON": seasons, "GAME_DATE": pd.Timestamp("2025-01-01"),
+                             "BASE_PTS": [np.nan] if len(builds) == 1 else [110.0]})
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(cli, "_load", lambda seasons: (None, None))
+    monkeypatch.setattr(cli.data, "bpm", lambda season: None)
+    monkeypatch.setattr(cli.lineup, "player_impact", lambda bpm: None)
+    monkeypatch.setattr(cli.features, "historical_features", build)
+    cli._historical(["2024-25"])          # saved with a gap
+    assert cli._historical(["2024-25"])["BASE_PTS"].tolist() == [110.0]
+    cli._historical(["2024-25"])          # complete now: reused
+    assert len(builds) == 2
+
+
+def test_zero_shrinkage_rates_a_team_with_no_games_at_league_average(monkeypatch):
+    from nbamodel import config
+
+    monkeypatch.setattr(config, "SHRINK_GAMES", 0)
+    league = {"PACE": 99.0, "ORTG": 114.0}
+    empty = np.array([], dtype=float)
+    rating = ratings._blend_history(np.array([], dtype=object), {"PACE": empty, "ORTG": empty, "DRTG": empty},
+                                    "2024-25", league)
+    assert rating == {"PACE": 99.0, "ORTG": 114.0, "DRTG": 114.0}
+    one = ratings._blend_history(np.array(["2024-25"]), {"PACE": np.array([101.0]), "ORTG": np.array([120.0]),
+                                                         "DRTG": np.array([108.0])}, "2024-25", league)
+    assert one == {"PACE": 101.0, "ORTG": 120.0, "DRTG": 108.0}   # with no shrinkage, its own games only
+
+
 def test_push_predictions_uses_its_own_branch(monkeypatch, tmp_path):
     """Predictions go to their own branch on the remote; the checked-out branch is untouched."""
     import subprocess
@@ -789,3 +824,40 @@ def test_later_run_keeps_predictions_for_games_already_started(monkeypatch, tmp_
     changes = (tmp_path / "2026-10-26_changes.md").read_text()
     assert "MIN @ CLE" in changes and "WAS @ CHA" not in changes
 
+
+
+def test_tuning_grid_includes_the_values_in_use():
+    from nbamodel import cli
+
+    for heading, _, options in cli.TUNING:
+        assert cli._current_option(options), heading
+
+
+def test_tune_keeps_a_winner_in_place_and_restores_config(monkeypatch, tmp_path):
+    from nbamodel import cli, config, report
+
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "VALIDATION_SEASONS", ["2023-24", "2024-25"])
+    monkeypatch.setattr(config, "TEST_SEASON", "2025-26")
+    monkeypatch.setattr(config, "RATING_HALF_LIFE_GAMES", 12)
+    plain = _fake_features()
+    # Only a rating half-life of 18 games brings the formula closer to what happened.
+    sharper = plain.assign(BASE_PTS=(plain["BASE_PTS"] + plain["PTS"] - 1.5 * (2 * plain["IS_HOME"] - 1)) / 2)
+    seen = []
+
+    def historical(seasons):
+        seen.append(config.RATING_HALF_LIFE_GAMES)
+        return sharper if config.RATING_HALF_LIFE_GAMES == 18 else plain
+
+    monkeypatch.setattr(cli, "_historical", historical)
+    cli.main(["tune"])
+    tables = report.read_tables(tmp_path / "results" / "tuning.md")
+    half_life = tables["Rating half-life (games)"]
+    assert half_life.loc[half_life["Value"] == 12, "Verdict"].item() == "current"
+    assert half_life.loc[half_life["Value"] == 18, "Verdict"].item() == "better"
+    summary = tables["Summary"].set_index("Setting")["Test picked"]
+    assert summary["Rating half-life"] == 18
+    assert summary["Last season's games"] == 0.4             # ties keep the value in use
+    assert seen[-1] == 18                                      # later settings ran with the winner in place
+    assert config.RATING_HALF_LIFE_GAMES == 12                 # config.py's value is restored
+    assert (tmp_path / "docs" / "figures" / "tuning.png").stat().st_size > 10_000

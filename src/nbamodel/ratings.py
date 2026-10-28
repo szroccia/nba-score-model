@@ -100,6 +100,8 @@ def _blend_history(seasons: np.ndarray, values: dict, season: str, league: dict)
     total = w.sum() + shrink
     # Defense is shrunk toward the same league average as offense (DRTG to ORTG, OPP_EFG_PCT to EFG_PCT).
     prior = {k: league["ORTG"] if k == "DRTG" else league[k.removeprefix("OPP_")] for k in values}
+    if total == 0:  # no games yet and no shrinkage (SHRINK_GAMES = 0): the league average is all there is
+        return {k: float(prior[k]) for k in values}
     return {k: float((np.dot(w, v) + shrink * prior[k]) / total) for k, v in values.items()}
 
 

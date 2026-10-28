@@ -8,6 +8,7 @@
     python -m nbamodel explain --game BOS   # how one game's prediction is built
     python -m nbamodel evaluate         # cross-validation, tuning curves and Vegas benchmark
     python -m nbamodel evaluate --compare all   # plus with/without tables for each setting decision
+    python -m nbamodel tune             # test the hand-picked settings one by one (decision 10)
     python -m nbamodel injuries         # check what the injury report reader finds
     python -m nbamodel predict          # today's games with the latest injury report
     python -m nbamodel daily            # refresh this season's data, then predict
@@ -67,7 +68,9 @@ def _historical(seasons: list[str]) -> pd.DataFrame:
     path = config.DATA_DIR / f"features_v{config.FEATURE_VERSION}_playoffs-{config.PLAYOFF_GAMES}_{fingerprint}.csv"
     if path.exists():
         cached = pd.read_csv(path, parse_dates=["GAME_DATE"])
-        if set(seasons) <= set(cached["SEASON"]):
+        # Gaps mean a build from before a fix (zero rating shrinkage once left them); build it again.
+        complete = not cached.filter(items=features.FEATURES).isna().any().any()
+        if set(seasons) <= set(cached["SEASON"]) and complete:
             return cached[cached["SEASON"].isin(seasons)]
     games, players = _load(_all_seasons())
     impact = {s: lineup.player_impact(data.bpm(data.previous_season(s))) for s in seasons}
@@ -220,6 +223,100 @@ def cmd_evaluate(args):
         extra += ([""] if extra else []) + _comparison(name, seasons)
     print("\n".join(evaluate.run(_historical(seasons), lines_, abbr, extra)))
     print("Saved results/evaluation.md")
+    cmd_report(args)
+
+
+# The hand-picked settings `tune` checks (decision 10, fixed before any results), in this order.
+# Each option sets one or more config values; the value in use must be one of them.
+TUNING = [
+    ("Rating half-life", "games", [(str(v), {"RATING_HALF_LIFE_GAMES": v}) for v in (6, 9, 12, 18, 24)]),
+    ("Last season's games", "weight", [(str(v), {"PRIOR_SEASON_GAME_WEIGHT": v}) for v in (0.2, 0.4, 0.6, 0.8)]),
+    ("Rating shrinkage", "games of league average", [(str(v), {"SHRINK_GAMES": v}) for v in (0, 2, 4, 8)]),
+    ("Minutes half-life", "games", [(str(v), {"MINUTES_HALF_LIFE_GAMES": v}) for v in (2, 3, 5, 8, 12)]),
+    ("Rotation player cutoff", "minutes", [(str(v), {"ROTATION_MINUTES": v}) for v in (12, 16, 20, 24)]),
+    # Offense and defense keep the 3:1 split of the current -1.5 / -0.5; the label is the total.
+    ("Replacement level", "BPM, offense + defense",
+     [(f"{o + d:g}", {"REPLACEMENT_OBPM": o, "REPLACEMENT_DBPM": d}) for o, d in ((-0.75, -0.25), (-1.5, -0.5),
+                                                                                   (-2.25, -0.75))]),
+    ("BPM shrinkage", "minutes", [(str(v), {"BPM_PRIOR_MINUTES": v}) for v in (250, 500, 1000, 2000)]),
+    ("Rest days cap", "days", [(str(v), {"MAX_REST_DAYS": v}) for v in (2, 3, 5)]),
+]
+
+
+def _current_option(options: list) -> str:
+    return next(label for label, values in options
+                if all(getattr(config, attr) == v for attr, v in values.items()))
+
+
+def cmd_tune(args):
+    """Decision 10: check each setting in TUNING, in order, against the value in use, with the
+    noise test. A value replaces it only if it is "better" (several: the lowest margin error);
+    the settings after it are then checked with the new value in place. config.py is not
+    changed; results/tuning.md shows what the test picked."""
+    seasons = [s for s in config.TRAIN_SEASONS if s < config.TEST_SEASON]
+    original = {attr: getattr(config, attr) for _, _, options in TUNING for _, values in options for attr in values}
+    folds = {}
+
+    def cross_validate():
+        key = json.dumps(features.settings(), sort_keys=True)
+        if key not in folds:
+            folds[key] = evaluate.cross_validate(evaluate.validation_rows(_historical(seasons)),
+                                                 config.VALIDATION_SEASONS)[0]
+        return folds[key]
+
+    k = config.NOISE_STANDARD_ERRORS
+    lines = ["# Tuning the hand-picked settings", "",
+             "Decision 10 in docs/decisions.md. Each setting is checked in this order against the value in use, "
+             f"on the same validation folds. Changes are in average error on the same games; noise is {k} standard "
+             "errors, measured month to month. A value replaces the one in use only if it beats the noise "
+             f"(margin error first, then total error) and doesn't move the average total more than "
+             f"{config.BIAS_GUARD_POINTS} points further from the actual. Otherwise the value in use stays. "
+             "The settings after it are checked with the winner in place.", ""]
+    summary = []
+    try:
+        for heading, unit, options in TUNING:
+            current = _current_option(options)
+            in_use = dict(options)[current]
+            print(f"Tuning {heading.lower()} (in use: {current})...")
+            preds = {}
+            for label, values in options:
+                for attr, v in values.items():
+                    setattr(config, attr, v)
+                preds[label] = cross_validate()
+                for attr, v in in_use.items():
+                    setattr(config, attr, v)
+            lines += [f"## {heading} ({unit})", "",
+                      "| Value | Games | Margin MAE | Total MAE | Winner % | Total bias | Margin change "
+                      "| Margin noise | Total change | Total noise | Verdict |",
+                      "|" + " --- |" * 11]
+            scores, winners = {}, []
+            for label, _ in options:
+                m = scores[label] = evaluate.metrics(preds[label])
+                if label == current:
+                    test = ["-", "-", "-", "-", "current"]
+                else:
+                    t = evaluate.noise_test(preds[current], preds[label])
+                    test = [f"{t['margin'][0]:+.3f}", f"{k * t['margin'][1]:.3f}",
+                            f"{t['total'][0]:+.3f}", f"{k * t['total'][1]:.3f}", t["verdict"]]
+                    if t["verdict"] == "better":
+                        winners.append(label)
+                lines.append(evaluate._row(label, m, *test))
+            picked = min(winners, key=lambda w: [scores[w][c] for c in config.SELECTION_METRICS]) if winners else current
+            for attr, v in dict(options)[picked].items():
+                setattr(config, attr, v)
+            edge = picked != current and picked in (options[0][0], options[-1][0])
+            lines += ["", f"**{'Changed to ' + picked if picked != current else 'Kept ' + current}.**"
+                      + (" The winner is at the end of the values tried." if edge else ""), ""]
+            summary.append(f"| {heading} | {current} | {picked} |")
+    finally:
+        for attr, v in original.items():
+            setattr(config, attr, v)
+    lines += ["## Summary", "", "| Setting | In use before | Test picked |", "| --- | --- | --- |", *summary]
+    out = config.ROOT / "results" / "tuning.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(lines) + "\n")
+    print("\n".join(lines[-len(summary) - 2:]))
+    print(f"Saved {out}")
     cmd_report(args)
 
 
@@ -536,6 +633,8 @@ def main(argv=None):
                              "'all' does every one (repeatable)")
     inj = sub.add_parser("injuries", help="Show what the injury report reader finds")
     inj.add_argument("--file", help="Read a downloaded injury report PDF instead of fetching the latest")
+    sub.add_parser("tune", help="Test the hand-picked settings one by one (decision 10), "
+                   "written to results/tuning.md")
     sub.add_parser("report", help="Redraw the charts in docs/figures from results/ and data/model.json")
     p_explain = sub.add_parser("explain", help="Chart of how one game's prediction is built")
     p_explain.add_argument("--game", required=True, help="Either team's abbreviation, e.g. BOS")
@@ -563,6 +662,8 @@ def main(argv=None):
         cmd_backtest(args)
     elif args.command == "evaluate":
         cmd_evaluate(args)
+    elif args.command == "tune":
+        cmd_tune(args)
     elif args.command == "injuries":
         cmd_injuries(args)
     elif args.command == "report":

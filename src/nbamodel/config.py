@@ -12,7 +12,7 @@ MANUAL_STATUS_PATH = ROOT / "manual_status.csv"
 TRAIN_SEASONS = ["2022-23", "2023-24", "2024-25", "2025-26"]
 
 # Team ratings: exponentially weighted over past games.
-RATING_HALF_LIFE_GAMES = 12        # a game 12 games ago counts half as much as the last one
+RATING_HALF_LIFE_GAMES = 24        # a game 24 games ago counts half as much as the last one (12 before decision 10)
 PRIOR_SEASON_GAME_WEIGHT = 0.4     # last season's games count less once a new season starts
 # How playoff games feed team ratings (they are slower and lower scoring than the regular season):
 #   "include"  - use them as they are
@@ -33,16 +33,17 @@ PLAY_PROBABILITY = {
     "available": 1.0,
 }
 
-# Player impact (Box Plus/Minus) for players with no BPM on record.
-REPLACEMENT_OBPM = -1.5
-REPLACEMENT_DBPM = -0.5
+# Player impact (Box Plus/Minus) for players with no BPM on record: -3 in all since decision 10
+# (it was -1.5 / -0.5).
+REPLACEMENT_OBPM = -2.25
+REPLACEMENT_DBPM = -0.75
 # Minutes of current-season play at which this season's BPM counts as much as last season's.
 # Half of it also pulls players with few minutes last season toward replacement level
 # (250 minutes last season: half his own BPM, half replacement).
 BPM_PRIOR_MINUTES = 500
 
 # Recent minutes: exponentially weighted over a player's last games for his team.
-MINUTES_HALF_LIFE_GAMES = 5
+MINUTES_HALF_LIFE_GAMES = 12       # 5 before decision 10
 # Players who usually play at least this many minutes when available count as rotation players.
 ROTATION_MINUTES = 20
 

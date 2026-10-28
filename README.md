@@ -10,7 +10,7 @@ Validation seasons 2023-24 and 2024-25, 2,620 games. Each month is predicted by 
 
 | | Margin error (points) | Total error (points) | Winners picked |
 | --- | --- | --- | --- |
-| This model | 10.92 | 14.55 | 67.1% |
+| This model | 10.85 | 14.66 | 67.6% |
 | Vegas closing line | 10.62 | 14.15 | 68.7% |
 
 ![Model vs Vegas by month](docs/figures/vegas_by_month.png)
@@ -52,7 +52,7 @@ The regression then adds the adjustments for lineups, home court and rest. `pyth
 
 ![Model coefficients](docs/figures/coefficients.png)
 
-The formula is taken almost exactly at face value (about 0.99). Home court is worth about 2 points, and facing a team on the second night of a back-to-back about 1. The coefficients are saved in `data/model.json`, and every tunable setting (rating half-life, injury status probabilities, replacement-level BPM and so on) is in `src/nbamodel/config.py`.
+The formula is taken at face value (about 1.00). Home court is worth about 2 points, and facing a team on the second night of a back-to-back about 1. The coefficients are saved in `data/model.json`, and every tunable setting (rating half-life, injury status probabilities, replacement-level BPM and so on) is in `src/nbamodel/config.py`.
 
 | Feature | Meaning |
 | --- | --- |
@@ -102,6 +102,7 @@ Each is explained with its evidence in the [decision log](docs/decisions.md):
 - [Playoff games kept in ratings](docs/decisions.md#6-playoff-games-in-ratings) and [ridge alpha 10](docs/decisions.md#7-ridge-strength)
 - [Strength-of-schedule adjustment](docs/decisions.md#8-strength-of-schedule), kept because it beat a noise test fixed in advance
 - [Four factors](docs/decisions.md#9-four-factors), tested and left out: they helped totals but hurt margins
+- [Hand-picked settings tuned](docs/decisions.md#10-hand-picked-settings): 3 of 8 changed after a test fixed in advance, with longer memory for team ratings and player minutes
 
 ## Data
 
@@ -132,6 +133,7 @@ python -m nbamodel train         # fit the model, writes data/model.json
 python -m nbamodel backtest      # accuracy by season, writes results/backtest.md
 python -m nbamodel evaluate      # cross-validation, tuning curves, Vegas benchmark (results/evaluation.md)
 python -m nbamodel evaluate --compare all   # adds a with/without table for each setting decision
+python -m nbamodel tune          # tests the hand-picked settings one by one (results/tuning.md)
 python -m nbamodel report        # redraw the charts in docs/figures
 python -m nbamodel predict       # today's games
 python -m nbamodel explain --game BOS   # chart of how one game's prediction is built
