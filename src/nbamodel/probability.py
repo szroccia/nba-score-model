@@ -171,7 +171,7 @@ def _verdict(change: float, se: float) -> str:
     return "better" if change < 0 else "worse"
 
 
-def _test_table(first: str, probs: dict, happened, folds, base: str, base_verdict: str,
+def noise_table(first: str, probs: dict, happened, folds, base: str, base_verdict: str,
                 names: dict) -> tuple[list[str], dict]:
     """Rows of log loss and Brier score, each method's log loss checked against base on the same
     games with the noise test. Returns the rows and each method's verdict."""
@@ -191,7 +191,7 @@ def _test_table(first: str, probs: dict, happened, folds, base: str, base_verdic
     return rows, verdicts
 
 
-def _best(verdicts: dict, losses: dict, fallback):
+def best(verdicts: dict, losses: dict, fallback):
     winners = [m for m, v in verdicts.items() if v == "better"]
     return min(winners, key=lambda m: losses[m]) if winners else fallback
 
@@ -233,9 +233,9 @@ def run(feats: pd.DataFrame, abbr: dict | None, lines: pd.DataFrame | None) -> t
     probs = {m: walk_forward(rec, scored, lambda h, m=m: fit_win(m, h), lambda p, g, m=m: win_probability(m, p, g))
              for m in WIN_METHODS}
     probs = {current: probs.pop(current), **probs}
-    rows, verdicts = _test_table("", probs, won, scored["FOLD"], current, "current", WIN_METHODS)
+    rows, verdicts = noise_table("", probs, won, scored["FOLD"], current, "current", WIN_METHODS)
     losses = {m: log_loss(p, won).mean() for m, p in probs.items()}
-    picked = _best(verdicts, losses, current)
+    picked = best(verdicts, losses, current)
     in_use = WIN_METHODS[current][0].lower()
     result = f"The {in_use} stays" if picked == current else f"{WIN_METHODS[picked][0]} beats the {in_use}"
     lines_out = [*intro, "## Win probability", "",
@@ -310,11 +310,11 @@ def run(feats: pd.DataFrame, abbr: dict | None, lines: pd.DataFrame | None) -> t
             keep = pd.concat(bet_probs, axis=1).dropna().index
             bet_probs = {m: p[keep] for m, p in bet_probs.items()}
             games, happened = games.loc[keep], happened[keep]
-            rows, verdicts = _test_table(f"{bet_name}: ", bet_probs, happened, games["FOLD"], "coin", "baseline",
+            rows, verdicts = noise_table(f"{bet_name}: ", bet_probs, happened, games["FOLD"], "coin", "baseline",
                                          LINE_METHODS)
             lines_out += rows
             losses = {m: log_loss(p, happened).mean() for m, p in bet_probs.items()}
-            picks[bet] = _best({m: v for m, v in verdicts.items() if m != "coin"}, losses, None)
+            picks[bet] = best({m: v for m, v in verdicts.items() if m != "coin"}, losses, None)
             # The side the model was on: did it win? Ties with the line pick no side.
             gap = games[predicted] - games[line]
             sided = gap != 0

@@ -57,20 +57,21 @@ def settings() -> dict:
     }
 
 
-def matchup_rows(games: pd.DataFrame, player_games: pd.DataFrame, impact: pd.DataFrame,
-                 date: pd.Timestamp, season: str, home_id: int, away_id: int,
-                 home_probs: dict, away_probs: dict, league: dict,
-                 home_roster: set | None = None, away_roster: set | None = None) -> list[dict]:
-    """Feature rows for both teams in one game, using only information from before the date.
+def team_state(games: pd.DataFrame, player_games: pd.DataFrame, impact: pd.DataFrame, date: pd.Timestamp,
+               season: str, team_id: int, probs: dict, league: dict, roster: set | None = None) -> dict:
+    """What one team brings to a game on a date: its ratings from earlier games, and the change
+    in them from who is expected to play (probs: chance of playing by name; roster: player ids)."""
+    minutes = lineup.recent_minutes(player_games, team_id, date, roster)
+    return {"TEAM_ID": team_id, "rating": ratings.team_rating(games, team_id, date, season, league),
+            "adj": lineup.lineup_adjustment(minutes, probs, impact)}
 
-    Rosters are sets of player ids; without them, everyone from recent games is assumed
-    to still be on the team."""
-    rating = {t: ratings.team_rating(games, t, date, season, league) for t in (home_id, away_id)}
-    rest = {t: ratings.rest_days(games, t, date) for t in (home_id, away_id)}
-    adj = {
-        team: lineup.lineup_adjustment(lineup.recent_minutes(player_games, team, date, roster), probs, impact)
-        for team, roster, probs in ((home_id, home_roster, home_probs), (away_id, away_roster, away_probs))
-    }
+
+def pair_rows(home: dict, away: dict, home_rest: int, away_rest: int, league: dict) -> list[dict]:
+    """Feature rows for both teams in one game, from each team's state and days of rest."""
+    rating = {s["TEAM_ID"]: s["rating"] for s in (home, away)}
+    adj = {s["TEAM_ID"]: s["adj"] for s in (home, away)}
+    rest = {home["TEAM_ID"]: home_rest, away["TEAM_ID"]: away_rest}
+    home_id, away_id = home["TEAM_ID"], away["TEAM_ID"]
     pace = rating[home_id]["PACE"] * rating[away_id]["PACE"] / league["PACE"]
     rows = []
     for team, opp, is_home in ((home_id, away_id, 1), (away_id, home_id, 0)):
@@ -97,6 +98,20 @@ def matchup_rows(games: pd.DataFrame, player_games: pd.DataFrame, impact: pd.Dat
             }
         )
     return rows
+
+
+def matchup_rows(games: pd.DataFrame, player_games: pd.DataFrame, impact: pd.DataFrame,
+                 date: pd.Timestamp, season: str, home_id: int, away_id: int,
+                 home_probs: dict, away_probs: dict, league: dict,
+                 home_roster: set | None = None, away_roster: set | None = None) -> list[dict]:
+    """Feature rows for both teams in one game, using only information from before the date.
+
+    Rosters are sets of player ids; without them, everyone from recent games is assumed
+    to still be on the team."""
+    home = team_state(games, player_games, impact, date, season, home_id, home_probs, league, home_roster)
+    away = team_state(games, player_games, impact, date, season, away_id, away_probs, league, away_roster)
+    return pair_rows(home, away, ratings.rest_days(games, home_id, date), ratings.rest_days(games, away_id, date),
+                     league)
 
 
 def historical_features(games: pd.DataFrame, player_games: pd.DataFrame, impact_by_season: dict,

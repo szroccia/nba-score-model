@@ -19,6 +19,7 @@ The major modeling choices, what was considered, the evidence and the reason for
 | 11 | [Kinds of model](#11-kinds-of-model) | Ridge regression stays | Five flexible models were worse on margin error beyond the noise; elastic net and a blend tied |
 | 12 | [Better team ratings](#12-better-team-ratings) | Change detection (CUSUM) at 80; season-start prior and trend left out | CUSUM beat the noise on total error, with margin a tie; the others tied or were worse |
 | 13 | [How sure is each prediction](#13-how-sure-is-each-prediction) | Normal spread for win probability; no cover or over/under odds | The calibration methods tied; odds against the line did no better than a coin flip |
+| 14 | [Season and playoff odds](#14-season-and-playoff-odds) | Simulate seasons with independent luck in every game | Lasting team errors tied on playoff odds, though their win ranges fit better |
 
 ---
 
@@ -418,3 +419,66 @@ Elastic net, k-nearest neighbors, support vector regression and the neural netwo
 ![Calibration of win probabilities](figures/calibration.png)
 
 ![Probability tests](figures/probability_tests.png)
+
+---
+
+## 14. Season and playoff odds
+
+**Question.** How likely is each team to make the playoffs, reach the Finals or win the title? The model predicts single games, so season odds come from playing out the rest of the season many times. The open question is how to draw the luck in each simulated game.
+
+**How a season is played out.**
+- On the day of the simulation, every remaining regular-season game gets the model's predicted margin from each team's ratings and roster that day, with home court and rest from the schedule. The predictions stay frozen: simulated results never feed back into ratings.
+- Each simulated game ends at its prediction plus a random miss, and the season is played out 10,000 times.
+- Standings go by win percentage. Teams tied in a conference are split by their head-to-head record against each other, then by a coin flip. The NBA's longer list of tiebreakers (division titles, conference record and more) is left out.
+- The play-in follows the NBA's format: 7 hosts 8, and the winner is the 7 seed; 9 hosts 10; the loser of 7-8 hosts the winner of 9-10 for the 8 seed.
+- Then four rounds of best-of-seven. The better seed gets home court (games 1, 2, 5 and 7), and in the Finals the better record does. Play-in and playoff games use the same predictions, with both teams on one day of rest.
+- A team's odds of anything are the share of simulated seasons in which it happens. Each team also gets its average win total and the middle 80% of its simulated win totals.
+
+**Rosters and injuries (Steve, October 30, 2026): healthy roster plus manual list.** Daily season odds use each team's roster today, everyone healthy, except players in `manual_status.csv`, who stay at that status for every remaining game: a player marked out misses the rest of the season. The official injury report isn't used, because it covers only the next game or two.
+
+**Where the spread comes from.** Frozen predictions miss by more than decision 13's monthly ones, because they are made weeks or months ahead and teams change in the meantime. So the spread is learned from frozen predictions. Each record season (2022-23 to 2024-25) is played forward from the first of November, December, January, February, March and April, with only what was known that day: the games so far, ratings as of the day, a regression fit on earlier games, and each team's roster as the players who had played for it that season, all assumed healthy. How far those frozen predictions missed is the record.
+
+| # | Method | What it does | Numbers it learns |
+| --- | --- | --- | --- |
+| 1 | Independent games (in use) | Every simulated game misses by fresh luck, as wide as frozen predictions have missed (the root mean square) | 1 |
+| 2 | Lasting team errors | The same total miss, split in two: a part drawn once per team per simulated season, which stays with it for every remaining game (a team better or worse than its rating says), and fresh luck every night. The split comes from how much more teams' average misses differ than nightly luck alone would make them (a one-way random-effects model, fit by the method of moments) | 2 |
+
+**Why the second might help, and why it might not.** Independent luck evens out over many games, so a team's simulated win total hugs its predictions, and odds made months ahead may be too sure. Real errors last: a team rated too low in November tends to stay underrated in frozen predictions all season. Lasting errors spread win totals out the way real seasons do. But the split is estimated from 30 teams at a time, and if little of the miss lasts, it adds only noise.
+
+**Settings fixed with the methods,** not tested: 10,000 simulated seasons; one day of rest in play-in and playoff games; the tiebreaker above; in scoring, no chance below 1% or above 99%, as in decision 13.
+
+**Test fixed in advance,** written down before any results existed (October 30, 2026). `python -m nbamodel season --backtest` runs it and writes [results/season.md](../results/season.md):
+
+1. Play out each validation season (2023-24 and 2024-25) with each method from the first of each month, November to April, with only what was known that day. Each season's spread is fit only on the frozen predictions of earlier seasons (2023-24 on 2022-23; 2024-25 on 2022-23 and 2023-24), so no season helps score itself.
+2. Score the chance of making the playoffs (directly or through the play-in) by log loss: 30 teams, 6 days and 2 seasons make 360 forecasts per method.
+3. Compare lasting team errors with independent games on the same forecasts, with the noise test from decisions 8 to 13: the average change in log loss must exceed 2 standard errors. Each team-season (its six forecasts) is one block, because forecasts for the same team in the same season move together.
+4. Lasting team errors replace independent games only if they are better beyond the noise. A tie keeps independent games, the simpler.
+5. Reported, never deciding: the Brier score; calibration (for each tenth of predicted chance, how often those teams made the playoffs); win totals (the average miss against actual wins, and the share of actual totals inside the 80% range, with the record so far scaled to 82 games as a baseline); log loss by the day the simulation started; the eventual champion's title odds and rank from each day; and the spread each season used.
+6. **Luck.** One comparison has about a 1 in 20 chance of passing by luck alone. The locked test season isn't used.
+
+**What this test can't check.**
+- Only 60 team-seasons decide, and by April most playoff spots are settled, so the test has little power: a tie is likely unless the methods differ a lot. The win totals and calibration help read it.
+- The backtest treats everyone who had played as healthy, because past injury reports aren't kept. Live odds use today's roster and the manual list, so a long injury hurts backtest forecasts more than it should hurt live ones, if the manual list is kept up.
+- Title odds can't really be checked: two seasons give two champions.
+- One spread serves every day, though predictions from November miss by more than predictions from April. Lasting team errors capture part of that, since a lasting part matters more over more games.
+- Live only: until the league sets each team's last two games after the NBA Cup group stage in December, the schedule lists 80 games, and the two unset games are left out of the simulation.
+
+**In daily runs.** `train` measures the spread on the whole record (2022-23 to 2024-25, never the test season) and saves it, with the method in use, in `data/model.json`. `python -m nbamodel season` writes `predictions/<date>_season.csv`, and `daily` runs it after the game predictions, until the regular season ends. If the test picks lasting team errors, switching is a separate step after the result.
+
+**Result (October 30, 2026).** Full tables are in [results/season.md](../results/season.md). The two methods tied, so independent games stay:
+
+| Method | Log loss | Brier score | Log loss change | Noise | Verdict |
+| --- | --- | --- | --- | --- | --- |
+| Independent games (in use) | 0.3134 | 0.1003 | - | - | current |
+| Lasting team errors | 0.3006 | 0.0972 | -0.0127 | 0.0281 | tie |
+
+- **Independent games stay.** Lasting team errors were better on average, by less than half the noise. With 60 team-seasons, the test could only catch a big difference, as expected.
+- **Lasting errors help early in the season.** Simulated from November 1, they lowered log loss from 0.520 to 0.474, and from December 1 and January 1 by about 0.02. From February on, the two are within 0.01 of each other. A lasting part matters most when many games remain.
+- **The odds are useful.** Log loss is 0.313, against 0.691 for giving every team 53%. It falls from 0.52 on November 1 to 0.14 on April 1. Grouped in tenths, the chances sit close to how often teams made it. Independent games were a little too sure in one tenth: teams given 80 to 90% made it 75% of the time (24 forecasts), where lasting errors' 80 to 90% made it 90%.
+- **Win ranges from independent games are too narrow.** Both methods miss actual win totals by 4.1 wins on average; the record so far, scaled to a full season, misses by 5.1. But only 61.9% of actual totals landed inside the independent games' 80% range, against 78.9% for lasting team errors. Fresh luck every game evens out over many games, so it understates how far a team's season can drift. Win ranges were reported but didn't decide (point 5), so daily win ranges stay too narrow by about that much. Using lasting errors for win ranges would be a new decision with its own test.
+- **How far frozen predictions miss.** The typical miss is 13.4 to 14.1 points a game, a little more than the 13.6 of decision 13's predictions, which are refit every month. About 2.5 to 2.8 points of it stays with a team for the rest of the season.
+- **The champions.** Boston (2023-24) had the best title odds on every snapshot day, from 30.5% on November 1 to 71.0% on April 1. Oklahoma City (2024-25) ranked first or second every day, from 22.5% to 45.7%. Two champions can't check title odds, but neither surprised the simulation.
+
+**What daily runs use,** as fixed in advance: independent games, with a typical miss of 14.4 points, measured on 11,209 frozen predictions from 2022-23 to 2024-25.
+
+![Season simulation](figures/season_odds.png)

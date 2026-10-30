@@ -1185,10 +1185,261 @@ def test_train_saves_win_probability_from_the_record_only(monkeypatch, tmp_path)
     feats = _fake_features()
     monkeypatch.setattr(cli, "_historical", lambda seasons: feats[feats["SEASON"].isin(seasons)])
     monkeypatch.setattr(cli.model, "save", lambda fitted: config.MODEL_PATH.write_text(json.dumps(fitted)))
+    monkeypatch.setattr(cli, "_season_spread", lambda feats: {"method": "independent", "spread": {"sd_total": 13.0}})
     cli.main(["train"])
     saved = json.loads(config.MODEL_PATH.read_text())
+    assert saved["season"]["method"] == "independent"
     chances = saved["probability"]
     assert saved["seasons"][-1] == "2025-26"                         # the regression trains on every season
     assert chances["seasons"] == ["2022-23", "2023-24", "2024-25"]   # the misses never include the test season
     assert chances["win_method"] == "normal" and chances["win"]["sd"] == chances["margin_sd"]
     assert 9 < chances["margin_sd"] < 16 and "cover" not in chances and "over" not in chances
+
+
+# Decision 14: season and playoff simulation.
+
+def _league30():
+    """30 teams with real abbreviations, so each has a conference."""
+    from nbamodel import simulation
+
+    abbr = dict(enumerate(simulation.CONFERENCES["East"] + simulation.CONFERENCES["West"], start=1))
+    return list(abbr), abbr, simulation.conferences(abbr)
+
+
+def _round_robin_schedule(teams, rounds=82, seed=0, start="2024-10-22"):
+    rng = np.random.default_rng(seed)
+    rows, day = [], pd.Timestamp(start)
+    for _ in range(rounds):
+        perm = rng.permutation(teams)
+        rows += [{"GAME_ID": len(rows) + 1, "GAME_DATE": day, "HOME_ID": int(h), "AWAY_ID": int(a)}
+                 for h, a in zip(perm[::2], perm[1::2])]
+        day += pd.Timedelta(days=2)
+    return pd.DataFrame(rows)
+
+
+def test_simulated_odds_add_up_and_favor_better_teams():
+    from nbamodel import simulation
+
+    teams, abbr, conference = _league30()
+    strength = dict(zip(teams, np.linspace(-8, 8, 30)))
+    sched = _round_robin_schedule(teams)
+    rng = np.random.default_rng(1)
+    edge = sched["HOME_ID"].map(strength) - sched["AWAY_ID"].map(strength) + 2
+    played = sched[sched["GAME_DATE"] < "2025-01-01"].assign(MARGIN=edge + rng.normal(0, 12, len(sched)))
+    remaining = sched[sched["GAME_DATE"] >= "2025-01-01"].assign(PRED=edge)
+    pairs = np.array([[strength[i] - strength[j] + 2 for j in teams] for i in teams])
+    odds = {sd_team: simulation.simulate(teams, conference, played, remaining, pairs, 12.0, sd_team, n_sims=2000)
+            for sd_team in (0.0, 3.0)}
+    for out in odds.values():
+        # Every simulated season has 12 top-six teams, 8 in the play-in, 16 in the playoffs, one champion.
+        for column, total in (("TOP6", 12), ("PLAY_IN", 8), ("PLAYOFFS", 16), ("ROUND2", 8), ("CONF_FINALS", 4),
+                              ("FINALS", 2), ("TITLE", 1)):
+            assert out[column].sum() == pytest.approx(total)
+        assert (out["GAMES"] == 82).all() and (out["WINS_LOW"] <= out["WINS"]).all()
+        assert (out["WINS"] <= out["WINS_HIGH"]).all()
+        assert (out["WINS"] >= out["WINS_NOW"]).all()
+        best_east, best_west = out.iloc[14], out.iloc[29]       # the strongest team in each conference
+        assert best_west["TITLE"] > best_east["TITLE"] > out.iloc[0]["TITLE"]
+    # A team's lasting error widens its range of win totals.
+    width = {k: (o["WINS_HIGH"] - o["WINS_LOW"]).mean() for k, o in odds.items()}
+    assert width[3.0] > width[0.0] + 2
+
+
+def _finished_season(teams, conference, wins, h2h):
+    """82 games for every team, with given wins; h2h lists (winner, loser) games between two East teams."""
+    east = [t for t in teams if conference[t] == "East"]
+    west = [t for t in teams if conference[t] == "West"]
+    rows = [{"HOME_ID": w, "AWAY_ID": l, "MARGIN": 5} for w, l in h2h]
+    for k, t in enumerate(east):
+        in_h2h = sum(t in g for g in h2h)
+        won = wins[t] - sum(w == t for w, _ in h2h)
+        for g in range(82 - in_h2h):
+            rows.append({"HOME_ID": t, "AWAY_ID": west[(k + g) % 15], "MARGIN": 5 if g < won else -5})
+    return pd.DataFrame(rows)
+
+
+@pytest.mark.parametrize("series,sixth", [([("X", "Y"), ("X", "Y"), ("Y", "X")], 1.0),
+                                          ([("Y", "X"), ("Y", "X"), ("X", "Y")], 0.0),
+                                          ([("X", "Y"), ("Y", "X")], 0.5)])
+def test_tied_teams_are_seeded_by_head_to_head_then_a_coin_flip(series, sixth):
+    from nbamodel import simulation
+
+    teams, abbr, conference = _league30()
+    east = [t for t in teams if conference[t] == "East"]
+    x, y = east[5], east[6]
+    wins = dict(zip(east, [60, 58, 56, 54, 52, 45, 45, 40, 38, 36, 30, 28, 26, 24, 22]))
+    played = _finished_season(teams, conference, wins, [({"X": x, "Y": y}[w], {"X": x, "Y": y}[l]) for w, l in series])
+    none = pd.DataFrame(columns=["HOME_ID", "AWAY_ID", "PRED"])
+    out = simulation.simulate(teams, conference, played, none, np.zeros((30, 30)), 12.0, 0.0, n_sims=2000).set_index(
+        "TEAM_ID")
+    assert (out.loc[east[:5], "TOP6"] == 1).all() and out.loc[x, "WINS"] == out.loc[y, "WINS"] == 45
+    assert out.loc[x, "TOP6"] == pytest.approx(sixth, abs=0.05)
+    assert out.loc[x, "TOP6"] + out.loc[y, "TOP6"] == pytest.approx(1)
+    assert (out.loc[east[7:10], "PLAY_IN"] == 1).all() and (out.loc[east[10:], "PLAYOFFS"] == 0).all()
+
+
+def test_spread_splits_into_lasting_team_part_and_nightly_luck():
+    from nbamodel import simulation
+
+    teams, _, _ = _league30()
+    rng = np.random.default_rng(3)
+    for sd_team in (0.0, 3.0):
+        frames = []
+        for season in ("2022-23", "2023-24"):
+            for day in simulation.snapshot_dates(season):
+                sched = _round_robin_schedule(teams, rounds=40, seed=int(rng.integers(1e6)))
+                lasting = dict(zip(teams, rng.normal(0, sd_team, 30)))
+                miss = sched["HOME_ID"].map(lasting) - sched["AWAY_ID"].map(lasting) + rng.normal(0, 12, len(sched))
+                frames.append(sched.assign(SEASON=season, SNAPSHOT=day, PRED=0.0, MARGIN=miss))
+        spread = simulation.fit_spread(pd.concat(frames))
+        assert spread["sd_team"] == pytest.approx(sd_team, abs=0.6)
+        assert spread["sd_game"] == pytest.approx(12, abs=0.3)
+        assert spread["sd_total"] ** 2 == pytest.approx(2 * spread["sd_team"] ** 2 + spread["sd_game"] ** 2)
+        assert simulation.spreads_for("independent", spread) == (spread["sd_total"], 0.0)
+        assert simulation.spreads_for("lasting", spread) == (spread["sd_game"], spread["sd_team"])
+
+
+def _fake_nba(seasons=("2022-23", "2023-24", "2024-25"), seed=0):
+    """82-game seasons of a 30-team league with box scores, one playoff round for each conference's top
+    eight and a final between the two best records. Team strength is new each season."""
+    teams, abbr, conference = _league30()
+    rng = np.random.default_rng(seed)
+    team_rows, player_rows = [], []
+
+    def play(h, a, day, gid, edge, season):
+        margin = edge + rng.normal(0, 12)
+        for team, opp, home in ((h, a, True), (a, h, False)):
+            team_rows.append({
+                "SEASON_ID": season, "TEAM_ID": team, "TEAM_ABBREVIATION": abbr[team], "GAME_ID": gid,
+                "GAME_DATE": day, "MATCHUP": f"{abbr[team]} vs. {abbr[opp]}" if home else f"{abbr[team]} @ {abbr[opp]}",
+                "MIN": 240, "FGM": 41, "FG3M": 13, "FGA": 88, "FTM": 17, "FTA": 22, "OREB": 10, "DREB": 33, "TOV": 14,
+                "PTS": round(112 + (margin if home else -margin) / 2), "SEASON": season})
+            player_rows.extend({"TEAM_ID": team, "GAME_ID": gid, "GAME_DATE": day, "SEASON": season,
+                                "PLAYER_ID": team * 100 + p, "PLAYER_NAME": f"Player {abbr[team]} {chr(65 + p)}", "MIN": 30}
+                               for p in range(8))
+        return margin
+
+    gid = 0
+    for season in seasons:
+        strength = dict(zip(teams, rng.normal(0, 5, 30)))
+        start = int(season[:4])
+        wins = dict.fromkeys(teams, 0)
+        for g in _round_robin_schedule(teams, seed=start, start=f"{start}-10-20").itertuples():
+            gid += 1
+            margin = play(g.HOME_ID, g.AWAY_ID, g.GAME_DATE, 20000000 + gid, strength[g.HOME_ID] - strength[g.AWAY_ID] + 2,
+                          season)
+            wins[g.HOME_ID if margin > 0 else g.AWAY_ID] += 1
+        finalists = []
+        for name in ("East", "West"):
+            top = sorted((t for t in teams if conference[t] == name), key=lambda t: -wins[t])[:8]
+            for x, y in zip(top[:4], top[::-1][:4]):
+                gid += 1
+                play(x, y, pd.Timestamp(f"{start + 1}-04-25"), 40000000 + gid, 5, season)
+            finalists.append(top[0])
+        gid += 1
+        play(*finalists, pd.Timestamp(f"{start + 1}-06-10"), 40000000 + gid, 5, season)
+    return pd.DataFrame(team_rows), pd.DataFrame(player_rows)
+
+
+def test_season_backtest_scores_each_season_with_earlier_spreads_only(monkeypatch, tmp_path):
+    from nbamodel import cli, config, data, report, simulation
+
+    team_games, player_games = _fake_nba()
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "TRAIN_SEASONS", ["2022-23", "2023-24", "2024-25", "2025-26"])
+    monkeypatch.setattr(config, "VALIDATION_SEASONS", ["2023-24", "2024-25"])
+    monkeypatch.setattr(config, "TEST_SEASON", "2025-26")
+    monkeypatch.setattr(config, "SEASON_SIMULATIONS", 300)
+    monkeypatch.setattr(config, "OPPONENT_ADJUST", False)
+    monkeypatch.setattr(config, "CUSUM_THRESHOLD", None)
+    feats = _fake_features(seasons=("2022-23", "2023-24", "2024-25"))
+    monkeypatch.setattr(cli, "_historical", lambda seasons: feats[feats["SEASON"].isin(seasons)])
+    monkeypatch.setattr(data, "team_games", lambda s, refresh=False: team_games[team_games["SEASON"] == s])
+    monkeypatch.setattr(data, "player_games", lambda s, refresh=False: player_games[player_games["SEASON"] == s])
+    monkeypatch.setattr(data, "bpm", lambda s, refresh=False: pd.DataFrame(columns=["Player", "MP", "OBPM", "DBPM", "BPM"]))
+    seen = []
+    fit_spread = simulation.fit_spread
+    monkeypatch.setattr(simulation, "fit_spread", lambda frozen: seen.append(sorted(frozen["SEASON"].unique()))
+                        or fit_spread(frozen))
+    cli.main(["season", "--backtest"])
+
+    assert seen == [["2022-23"], ["2022-23", "2023-24"]]   # each season's spread comes from earlier seasons only
+    path = tmp_path / "results" / "season.md"
+    tables = report.read_tables(path)
+    test = tables["Playoff odds"].set_index("Method")
+    # The schedule ends by April 1, so five snapshot days per season, 30 teams each.
+    assert list(test.index) == ["Independent games", "Lasting team errors"] and (test["Forecasts"] == 300).all()
+    assert test.loc["Independent games", "Verdict"] == "current"
+    assert (test["Log loss"] < 0.69).all()                 # better than giving every team 53%
+    spreads = tables["How far frozen predictions miss"].set_index("Validation season")
+    assert spreads.loc["2024-25", "Fit on"] == "2022-23, 2023-24" and 10 < spreads.loc["2023-24", "Typical miss, points"] < 16
+    assert len(tables["By snapshot day"]) == 5 and len(tables["The champion"]) == 2
+    assert tables["Calibration"]["Independent forecasts"].sum() == 300
+    text = path.read_text()
+    assert "**Independent games stay.**" in text or "**Lasting team errors beat independent games.**" in text
+    assert (tmp_path / "docs" / "figures" / "season_odds.png").stat().st_size > 10_000
+
+
+def test_season_odds_from_today_use_rosters_and_the_manual_list(monkeypatch, tmp_path):
+    from nbamodel import cli, config, data
+
+    team_games, player_games = _fake_nba(seasons=("2023-24", "2024-25"))
+    day = pd.Timestamp("2025-01-15")
+    finished = team_games[team_games["GAME_DATE"] < day]
+    season_games = team_games[(team_games["SEASON"] == "2024-25") & (team_games["GAME_ID"] < 40000000)]
+    home = season_games[season_games["MATCHUP"].str.contains("vs.")]
+    away = season_games[~season_games["MATCHUP"].str.contains("vs.")].set_index("GAME_ID").loc[home["GAME_ID"]]
+    monkeypatch.setattr(config, "PREDICTIONS_DIR", tmp_path / "predictions")
+    monkeypatch.setattr(config, "MANUAL_STATUS_PATH", tmp_path / "manual_status.csv")
+    monkeypatch.setattr(config, "SEASON_SIMULATIONS", 2000)
+    monkeypatch.setattr(config, "OPPONENT_ADJUST", False)
+    monkeypatch.setattr(config, "CUSUM_THRESHOLD", None)
+    monkeypatch.setattr(data, "team_games", lambda s, refresh=False: finished[finished["SEASON"] == s])
+    monkeypatch.setattr(data, "player_games", lambda s, refresh=False: player_games[
+        (player_games["SEASON"] == s) & (player_games["GAME_DATE"] < day)])
+    monkeypatch.setattr(data, "bpm", lambda s, refresh=False: pd.DataFrame(
+        {"Player": ["Player BOS A"], "MP": [2500], "OBPM": [8.0], "DBPM": [2.0], "BPM": [10.0]}))
+    monkeypatch.setattr(data, "schedule", lambda s, refresh=False: pd.DataFrame({
+        "GAME_ID": home["GAME_ID"].to_numpy(), "GAME_DATE": home["GAME_DATE"].to_numpy(), "GAME_TIME_UTC": "",
+        "HOME_TEAM_ID": home["TEAM_ID"].to_numpy(), "HOME_TEAM": home["TEAM_ABBREVIATION"].to_numpy(),
+        "AWAY_TEAM_ID": away["TEAM_ID"].to_numpy(), "AWAY_TEAM": away["TEAM_ABBREVIATION"].to_numpy()}))
+    roster = player_games[["TEAM_ID", "PLAYER_ID"]].drop_duplicates()
+    monkeypatch.setattr(data, "rosters", lambda s, refresh=False: roster.assign(PLAYER=""))
+    feats = _fake_features(seasons=("2023-24", "2024-25"))
+    fitted = model.fit(feats) | {"season": {"method": "lasting", "spread": {"sd_total": 13.0, "sd_team": 2.0,
+                                                                              "sd_game": 12.7, "games": 1000}}}
+    fitted["coefficients"] |= {"LINEUP_OFF_PTS": 1.0, "LINEUP_DEF_PTS": 1.0}   # lineup changes at face value
+    monkeypatch.setattr(model, "load", lambda: fitted)
+
+    (tmp_path / "manual_status.csv").write_text("TEAM,PLAYER,STATUS\n")
+    cli.main(["season", "--date", "2025-01-15"])
+    healthy = pd.read_csv(tmp_path / "predictions" / "2025-01-15_season.csv").set_index("team")
+    assert len(healthy) == 30 and healthy["playoffs"].sum() == pytest.approx(16, abs=0.01)
+    assert healthy["title"].sum() == pytest.approx(1, abs=0.01) and (healthy["method"] == "lasting").all()
+    assert ((healthy["wins_now"] + healthy["losses_now"] + healthy["games_left"]) == 82).all()
+    assert (healthy["games_left"] > 0).all() and set(healthy["conference"]) == {"East", "West"}
+
+    # His best player out for the rest of the season costs Boston wins and playoff odds.
+    (tmp_path / "manual_status.csv").write_text("TEAM,PLAYER,STATUS\nBOS,Player BOS A,out\n")
+    without = cli.season_odds(day).set_index("team")
+    assert without.loc["BOS", "wins"] < healthy.loc["BOS", "wins"] - 1
+    assert without.loc["BOS", "playoffs"] < healthy.loc["BOS", "playoffs"]
+
+    # Once the playoffs start, there are no season odds.
+    monkeypatch.setattr(data, "team_games", lambda s, refresh=False: team_games[team_games["SEASON"] == s])
+    assert cli.season_odds(pd.Timestamp("2025-05-01")) is None
+
+
+def test_daily_pushes_predictions_even_if_the_season_odds_fail(monkeypatch):
+    from nbamodel import cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_predict", lambda args, refresh=False, push=True: calls.append(("predict", push)))
+
+    def broken(args):
+        raise RuntimeError("schedule not out yet")
+
+    monkeypatch.setattr(cli, "cmd_season", broken)
+    monkeypatch.setattr(cli, "push_predictions", lambda day: calls.append(("push", day)))
+    cli.main(["daily", "--push", "--date", "2026-11-02"])
+    assert calls == [("predict", False), ("push", "2026-11-02")]

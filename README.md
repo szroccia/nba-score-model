@@ -17,6 +17,8 @@ Validation seasons 2023-24 and 2024-25, 2,620 games. Each month is predicted by 
 
 Each prediction also comes with a win probability, from how far the model's predictions missed in earlier months. When it gives the home team 70%, the home team wins about 70% of the time ([decision 13](docs/decisions.md#13-how-sure-is-each-prediction)).
 
+Season and playoff odds come from playing out the rest of the season 10,000 times. Simulated from the first of each month of 2023-24 and 2024-25, with only what was known that day, they scored a log loss of 0.31 on who made the playoffs (0.69 for giving every team 53%), and both champions had the best or second-best title odds all season ([decision 14](docs/decisions.md#14-season-and-playoff-odds)).
+
 The 2025-26 season is held back as a locked test set; see [How it's evaluated](#how-its-evaluated).
 
 ## How a prediction is built
@@ -100,7 +102,11 @@ Each run also pulls every team's current roster. Players who have left a team ar
 
 ![Calibration of win probabilities](docs/figures/calibration.png)
 
-Full tables are in [results/evaluation.md](results/evaluation.md), [results/comparison.md](results/comparison.md) and [results/probability.md](results/probability.md). `python -m nbamodel backtest` gives a simpler season-by-season check in [results/backtest.md](results/backtest.md). In all of them, lineups use who actually played (historical injury reports are not kept) and player values use only the previous season's BPM, to avoid looking ahead.
+`python -m nbamodel season --backtest` plays out past seasons from the first of each month with only what was known that day, and checks the playoff odds against who made it:
+
+![Season simulation](docs/figures/season_odds.png)
+
+Full tables are in [results/evaluation.md](results/evaluation.md), [results/comparison.md](results/comparison.md), [results/probability.md](results/probability.md) and [results/season.md](results/season.md). `python -m nbamodel backtest` gives a simpler season-by-season check in [results/backtest.md](results/backtest.md). In all of them, lineups use who actually played (historical injury reports are not kept) and player values use only the previous season's BPM, to avoid looking ahead.
 
 ## Key decisions
 
@@ -116,6 +122,7 @@ Each is explained with its evidence in the [decision log](docs/decisions.md):
 - [Ridge regression kept over seven other kinds of model](docs/decisions.md#11-kinds-of-model): a neural network, gradient boosting, random forest and others fit past games better but predicted new months worse
 - [Better team ratings](docs/decisions.md#12-better-team-ratings): change detection (CUSUM) added after a test fixed in advance; a season-start prior and a trend were tested and left out
 - [Win probability from a normal spread](docs/decisions.md#13-how-sure-is-each-prediction): logistic and isotonic calibration tied it; odds against the betting line did no better than a coin flip, so they aren't shown
+- [Season odds from simulated seasons](docs/decisions.md#14-season-and-playoff-odds) with fresh luck in every game: lasting team errors tied on playoff odds, though their win ranges fit better
 
 ## Data
 
@@ -150,12 +157,14 @@ python -m nbamodel tune          # tests the hand-picked settings one by one (re
 python -m nbamodel compare       # other kinds of model against ridge regression (results/comparison.md)
 python -m nbamodel tune --ratings # tests changes to how team ratings are built (results/ratings_tuning.md)
 python -m nbamodel probability   # win probability, score ranges, cover and over/under odds (results/probability.md)
+python -m nbamodel season --backtest   # tests the season simulation on past seasons (results/season.md)
 python -m nbamodel report        # redraw the charts in docs/figures
 python -m nbamodel predict       # today's games
+python -m nbamodel season        # season and playoff odds from today
 python -m nbamodel explain --game BOS   # chart of how one game's prediction is built
 ```
 
-`predict` accepts `--date YYYY-MM-DD` and `--no-injury-report` (use only `manual_status.csv`).
+`predict` accepts `--date YYYY-MM-DD` and `--no-injury-report` (use only `manual_status.csv`). `season` accepts `--date` too.
 
 ## Checking the data
 
@@ -163,7 +172,7 @@ python -m nbamodel explain --game BOS   # chart of how one game's prediction is 
 
 ## Daily updates
 
-`run_daily.sh` (Mac/Linux) or `run_daily.bat` (Windows) refreshes this season's data, reads the latest injury report, writes `predictions/<date>.csv` and pushes the predictions folder to a `predictions` branch on the git remote set in `config.PREDICTIONS_REMOTE`, kept apart from the code. Run it twice a day: once in the morning and once about an hour before the first game.
+`run_daily.sh` (Mac/Linux) or `run_daily.bat` (Windows) refreshes this season's data, reads the latest injury report, writes `predictions/<date>.csv`, updates the season and playoff odds in `predictions/<date>_season.csv` (until the regular season ends) and pushes the predictions folder to a `predictions` branch on the git remote set in `config.PREDICTIONS_REMOTE`, kept apart from the code. Run it twice a day: once in the morning and once about an hour before the first game.
 
 Mac/Linux, with `crontab -e` (times are your computer's local time):
 
@@ -202,12 +211,24 @@ Odds that the home team covers the spread (`home_cover_prob`) or that the game g
 
 `predictions/<date>_details.csv` has one row per team with every input and the points each step adds, which is what `explain` draws.
 
+`predictions/<date>_season.csv` has one row per team, from playing out the rest of the regular season and the playoffs 10,000 times ([decision 14](docs/decisions.md#14-season-and-playoff-odds)). Rosters are today's, with everyone healthy except players in `manual_status.csv`, who stay at that status for the rest of the season.
+
+| Column | Meaning |
+| --- | --- |
+| `wins_now`, `losses_now`, `games_left` | Record so far and games still to play |
+| `wins`, `wins_low`, `wins_high` | Average simulated win total, and the middle 80% of simulated win totals (too narrow: in the backtest, 62% of actual totals landed inside) |
+| `top6`, `play_in` | Chance of finishing in the top six of the conference, or 7th to 10th |
+| `playoffs` | Chance of reaching the playoffs, directly or through the play-in |
+| `round2`, `conf_finals`, `finals`, `title` | Chance of reaching each later round, and of winning the title |
+| `method`, `simulations` | How simulated games were drawn, and how many seasons were played out |
+
 ## Limitations and ideas
 
 - The model is limited by its inputs, not by data or the kind of model (see the [learning curve](docs/decisions.md#7-ridge-strength) and the [model comparison](docs/decisions.md#11-kinds-of-model)), so richer features are the next step.
 - Minutes for absent players are redistributed in proportion to usual minutes, not by position.
 - Rookies have no NBA minutes or BPM, so they count only once they start playing.
 - Box Plus/Minus misses defense that doesn't show up in the box score.
+- Season win ranges are too narrow: simulated games get fresh luck every night, which evens out, while real teams drift from their ratings for weeks at a time ([decision 14](docs/decisions.md#14-season-and-playoff-odds)).
 
 ## Tests
 

@@ -12,9 +12,11 @@
     python -m nbamodel tune --ratings   # test changes to how team ratings are built (decision 12)
     python -m nbamodel compare          # other kinds of model against ridge regression (decision 11)
     python -m nbamodel probability      # win probability, score ranges, cover and over/under odds (decision 13)
+    python -m nbamodel season           # season and playoff odds from today
+    python -m nbamodel season --backtest    # test the season simulation on past seasons (decision 14)
     python -m nbamodel injuries         # check what the injury report reader finds
     python -m nbamodel predict          # today's games with the latest injury report
-    python -m nbamodel daily            # refresh this season's data, then predict
+    python -m nbamodel daily            # refresh this season's data, predict, then update the season odds
 """
 
 import argparse
@@ -27,7 +29,7 @@ from datetime import date as date_cls
 import pandas as pd
 
 from . import (compare, config, data, evaluate, features, injuries, lineup, model, probability, ratings, report,
-               validate, vegas)
+               simulation, validate, vegas)
 from .names import normalize_name
 
 
@@ -79,11 +81,17 @@ def _historical(seasons: list[str]) -> pd.DataFrame:
         if set(seasons) <= set(cached["SEASON"]) and complete:
             return cached[cached["SEASON"].isin(seasons)]
     games, players = _load(_all_seasons())
-    impact = {s: lineup.player_impact(data.bpm(data.previous_season(s))) for s in seasons}
+    impact = _impacts(seasons)
     print(f"Building features for {', '.join(seasons)}, playoff games: {config.PLAYOFF_GAMES} (a few minutes)...")
     feats = features.historical_features(games, players, impact, seasons)
     feats.to_csv(path, index=False)
     return feats
+
+
+def _impacts(seasons: list[str]) -> dict:
+    """Player impact for each past season, from the season before it (its own BPM would come from
+    games not yet played)."""
+    return {s: lineup.player_impact(data.bpm(data.previous_season(s))) for s in seasons}
 
 
 def cmd_validate(args):
@@ -102,8 +110,16 @@ def cmd_train(args):
         lines_ = _vegas_lines(probability.record_seasons())
     abbr = vegas.team_abbreviations() if lines_ is not None else None
     fitted["probability"] = probability.fit_live(feats, abbr, lines_)
+    print("Measuring how far frozen predictions miss, for the season odds (a minute or two)...")
+    fitted["season"] = _season_spread(feats)
     model.save(fitted)
     print(json.dumps(fitted, indent=2))
+
+
+def _season_spread(feats: pd.DataFrame) -> dict:
+    """Decision 14: the simulation method in use, and how far frozen predictions missed in the record seasons."""
+    games, players = _load(_all_seasons())
+    return simulation.fit_live(feats, games, players, _impacts(probability.record_seasons()))
 
 
 TABLE_HEADER = ["| Season | Model | Games | Team points MAE | Margin MAE | Total MAE | Winner % | Total bias |",
@@ -433,6 +449,79 @@ def cmd_probability(args):
     cmd_report(args)
 
 
+def cmd_season(args):
+    """Season and playoff odds from the day on, saved to predictions/<date>_season.csv. With
+    --backtest, decision 14's test instead: results/season.md."""
+    if getattr(args, "backtest", False):
+        seasons = probability.record_seasons()
+        feats = _historical(seasons)
+        games, players = _load(_all_seasons())
+        print(f"Simulating {' and '.join(config.VALIDATION_SEASONS)} from the first of each month "
+              "(a few minutes)...")
+        text = simulation.backtest(feats, games, players, _impacts(seasons))
+        out = config.ROOT / "results" / "season.md"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("\n".join(text) + "\n", encoding="utf-8")
+        print("\n".join(line for line in text if line.startswith("**")))  # what the test found
+        print(f"Saved {out}")
+        cmd_report(args)
+        return
+    day = pd.Timestamp(getattr(args, "date", None) or date_cls.today().isoformat())
+    odds = season_odds(day)
+    if odds is None:
+        return
+    config.PREDICTIONS_DIR.mkdir(exist_ok=True)
+    path = config.PREDICTIONS_DIR / f"{day.date()}_season.csv"
+    try:
+        odds.to_csv(path, index=False)
+    except PermissionError:
+        print(f"Could not save {path}: it is probably open in Excel. Close it and run again.")
+        return
+    shown = odds.assign(record=odds["wins_now"].astype(str) + "-" + odds["losses_now"].astype(str),
+                        win_range=odds["wins_low"].astype(str) + "-" + odds["wins_high"].astype(str))
+    print(shown[["conference", "team", "record", "wins", "win_range", "playoffs", "finals", "title"]]
+          .to_string(index=False))
+    print(f"Saved {path}")
+
+
+def season_odds(day: pd.Timestamp) -> pd.DataFrame | None:
+    """Every team's season and playoff odds from the day on (decision 14). Teams are as on today's
+    rosters, all healthy except players in manual_status.csv, who stay at that status for every
+    remaining game. None once the regular season is over."""
+    season = data.season_for_date(day)
+    prev = data.previous_season(season)
+    games, players = _load([prev, season])
+    if (games["PLAYOFF"].astype(bool) & (games["SEASON"] == season)).any():
+        print("The playoffs have started; the season odds cover the regular season.")
+        return None
+    fitted = model.load()
+    if "season" not in fitted:
+        print("Note: data/model.json has no season simulation yet. Run `python -m nbamodel train` to add it.")
+        return None
+    sched = data.schedule(season)
+    # Regular-season games with both teams set (NBA Cup knockout games show no teams until they're decided).
+    sched = sched[sched["GAME_ID"].astype(str).str.zfill(10).str.startswith("002")
+                  & (sched["HOME_TEAM_ID"] > 0) & (sched["AWAY_TEAM_ID"] > 0)]
+    abbr = {**dict(zip(sched["HOME_TEAM_ID"], sched["HOME_TEAM"])),
+            **dict(zip(sched["AWAY_TEAM_ID"], sched["AWAY_TEAM"]))}
+    by_team = injuries.play_probabilities(injuries.manual_overrides())
+    probs = {t: by_team.get(a, {}) for t, a in abbr.items()}
+    impact = lineup.player_impact(data.bpm(prev), data.bpm(season))
+    roster = data.rosters(season).groupby("TEAM_ID")["PLAYER_ID"].apply(set).to_dict()
+    schedule = sched.rename(columns={"HOME_TEAM_ID": "HOME_ID", "AWAY_TEAM_ID": "AWAY_ID"})
+    odds = simulation.today(games, players, impact, season, day, fitted, schedule, abbr, probs, roster)
+    if odds is None:
+        print("The regular season is over; the season odds cover the regular season.")
+        return None
+    out = pd.DataFrame({"date": day.date().isoformat(), "team": odds["TEAM"], "conference": odds["CONFERENCE"],
+                        "wins_now": odds["WINS_NOW"], "losses_now": odds["PLAYED"] - odds["WINS_NOW"],
+                        "games_left": odds["GAMES"] - odds["PLAYED"], "wins": odds["WINS"].round(1),
+                        "wins_low": odds["WINS_LOW"], "wins_high": odds["WINS_HIGH"],
+                        **{c.lower(): odds[c].round(3) for c in simulation.ODDS},
+                        "method": fitted["season"]["method"], "simulations": config.SEASON_SIMULATIONS})
+    return out.sort_values(["conference", "wins"], ascending=[True, False]).reset_index(drop=True)
+
+
 def cmd_report(args):
     for path in report.run():
         print(f"Saved {path.relative_to(config.ROOT)}")
@@ -691,7 +780,7 @@ def _log_changes(old: pd.DataFrame, new: pd.DataFrame, day: str) -> None:
         print("\n".join(lines))
 
 
-def cmd_predict(args, refresh: bool = False, now: pd.Timestamp | None = None):
+def cmd_predict(args, refresh: bool = False, now: pd.Timestamp | None = None, push: bool = True):
     day = pd.Timestamp(args.date or date_cls.today().isoformat())
     details = []
     preds = predict_date(day, use_injury_report=not args.no_injury_report, refresh=refresh, details=details)
@@ -725,7 +814,7 @@ def cmd_predict(args, refresh: bool = False, now: pd.Timestamp | None = None):
              "vegas_total", *ODDS_COLUMNS.values()]
     print(preds[[c for c in shown if c in preds]].to_string(index=False))
     print(f"Saved {path}. For a game's breakdown: python -m nbamodel explain --date {day.date()} --game <team>")
-    if getattr(args, "push", False):
+    if push and getattr(args, "push", False):
         push_predictions(str(day.date()))
 
 
@@ -800,6 +889,11 @@ def main(argv=None):
                    "written to results/comparison.md")
     sub.add_parser("probability", help="Win probability, score ranges and cover and over/under odds "
                    "(decision 13), written to results/probability.md")
+    p_season = sub.add_parser("season", help="Season and playoff odds from today, saved to "
+                              "predictions/<date>_season.csv")
+    p_season.add_argument("--date", help="YYYY-MM-DD, default today")
+    p_season.add_argument("--backtest", action="store_true",
+                          help="Test the simulation on past seasons instead (decision 14), written to results/season.md")
     sub.add_parser("report", help="Redraw the charts in docs/figures from results/ and data/model.json")
     p_explain = sub.add_parser("explain", help="Chart of how one game's prediction is built")
     p_explain.add_argument("--game", required=True, help="Either team's abbreviation, e.g. BOS")
@@ -807,7 +901,7 @@ def main(argv=None):
     p_explain.add_argument("--out", help="Where to save the chart, default predictions/<date>_<away>-at-<home>.png")
     for name in ("predict", "daily"):
         p = sub.add_parser(name, help="Predict a day's games" if name == "predict"
-                           else "Refresh this season's data, then predict today")
+                           else "Refresh this season's data, predict today, then update the season odds")
         p.add_argument("--date", help="YYYY-MM-DD, default today")
         p.add_argument("--no-injury-report", action="store_true", help="Use only manual_status.csv")
         p.add_argument("--push", action="store_true",
@@ -833,6 +927,8 @@ def main(argv=None):
         cmd_compare(args)
     elif args.command == "probability":
         cmd_probability(args)
+    elif args.command == "season":
+        cmd_season(args)
     elif args.command == "injuries":
         cmd_injuries(args)
     elif args.command == "report":
@@ -842,4 +938,10 @@ def main(argv=None):
     elif args.command == "predict":
         cmd_predict(args)
     elif args.command == "daily":
-        cmd_predict(args, refresh=True)
+        cmd_predict(args, refresh=True, push=False)
+        try:
+            cmd_season(args)
+        except Exception as e:  # the game predictions are saved either way
+            print(f"Could not update the season odds ({e}).")
+        if args.push:
+            push_predictions(args.date or date_cls.today().isoformat())

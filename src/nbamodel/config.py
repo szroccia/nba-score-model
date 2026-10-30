@@ -97,6 +97,12 @@ PROBABILITY_FLOOR = 0.01
 COVER_ODDS = None
 OVER_UNDER_ODDS = None
 
+# Decision 14: season and playoff odds come from playing out the rest of the season many times with
+# frozen predictions. "independent" (every simulated game misses by fresh luck) is in use unless the
+# test picks "lasting" (part of each team's miss stays with it all season) (docs/decisions.md).
+SEASON_SIMULATION = "independent"
+SEASON_SIMULATIONS = 10_000
+
 # Ridge regression strength. Every alpha from 0.01 to 100 scored the same on validation
 # (results/evaluation.md); the selection rule breaks ties toward the simpler model, which is 10.
 RIDGE_ALPHA = 10.0

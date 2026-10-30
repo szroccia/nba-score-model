@@ -565,6 +565,58 @@ def probability_tests(tables: dict, out):
     return _save(fig, out)
 
 
+MIN_FORECASTS = 10
+
+
+def season_odds(tables: dict, out):
+    """Decision 14: when a simulation gave a team a 70% chance of making the playoffs, did about 70% of
+    such teams make it? Each method's tenths against what happened, and its log loss by the day the
+    simulation started. Tenths with fewer than MIN_FORECASTS forecasts swing by luck and are left off."""
+    plt = _plt()
+    test = tables["Playoff odds"]
+    bins, months = tables["Calibration"], tables["By snapshot day"]
+    names = [c[:-len(" forecasts")] for c in bins.columns if c.endswith(" forecasts")]
+    colors = dict(zip(names, (BLUE, ORANGE)))
+    labels = dict(zip(names, test["Method"]))
+    fig, (cal, by_day) = plt.subplots(1, 2, figsize=(11, 4.9), facecolor=SURFACE,
+                                      gridspec_kw={"width_ratios": [1, 1.15], "wspace": 0.28})
+    _style(cal, "Playoff odds against what happened", grid_axis="both")
+    cal.plot([0, 100], [0, 100], color=MUTED, linewidth=1, linestyle=(0, (4, 3)), label="Perfect calibration")
+    for name in names:
+        shown = bins[pd.to_numeric(bins[f"{name} forecasts"], errors="coerce").fillna(0) >= MIN_FORECASTS]
+        _line(cal, shown[f"{name} said"].astype(float), shown[f"Made it, {name.lower()}"].astype(float),
+              colors[name], labels[name])
+    cal.set_xlim(0, 100)
+    cal.set_ylim(0, 100)
+    cal.set_xlabel("Simulated chance of making the playoffs, %", fontsize=9, color=MUTED)
+    cal.set_ylabel("Made the playoffs, %", fontsize=9, color=MUTED)
+    _legend(cal, loc="upper left")
+    _style(by_day, "Log loss by the day the simulation started")
+    x = range(len(months))
+    for name in names:
+        _line(by_day, x, months[f"Log loss, {name.lower()}"].astype(float), colors[name], labels[name])
+    days = [f"{d[:3]} 1" for d in months["Simulated from"]]
+    by_day.set_xticks(list(x), days)
+    by_day.set_ylim(0, None)
+    by_day.set_ylabel("Log loss (lower is better)", fontsize=9, color=MUTED)
+    _legend(by_day, loc="upper right")
+    rows = test.set_index("Method")
+    current = test.loc[test["Verdict"] == "current", "Method"].iloc[0]
+    other = test[test["Verdict"] != "current"].iloc[0]
+    verdict = other["Verdict"]
+    title = (f"{other['Method']} beat {current.lower()}" if verdict == "better"
+             else f"{current} hold up" if verdict == "tie" else f"{other['Method']} do worse than {current.lower()}")
+    _headline(fig, f"Season simulation: {title}",
+              f"{int(rows.loc[current, 'Forecasts']):,} playoff forecasts per method: each validation season played "
+              f"out from the first of every month, {days[0]} to {days[-1]}, with only what was known that day. Log loss: "
+              f"{current.lower()} {float(rows.loc[current, 'Log loss']):.3f}, {other['Method'].lower()} "
+              f"{float(other['Log loss']):.3f} (change {float(other['Log loss change']):+.3f}, noise "
+              f"{float(other['Noise']):.3f}, by team-season). On the dashed line a 70% chance comes true 70% of the "
+              f"time; tenths with fewer than {MIN_FORECASTS} forecasts are left off.")
+    fig.subplots_adjust(left=0.07, right=0.98, top=0.72, bottom=0.12)
+    return _save(fig, out)
+
+
 def cv_scheme(out):
     """How evaluation splits time: rolling monthly folds on validation seasons, test season locked."""
     plt = _plt()
@@ -677,6 +729,8 @@ def run(fig_dir=None) -> list:
         tables = read_tables(results / "probability.md")
         made.append(calibration(tables, fig_dir / "calibration.png"))
         made.append(probability_tests(tables, fig_dir / "probability_tests.png"))
+    if (results / "season.md").exists():
+        made.append(season_odds(read_tables(results / "season.md"), fig_dir / "season_odds.png"))
     if (results / "evaluation.md").exists():
         tables = read_tables(results / "evaluation.md")
         if "Against the Vegas closing line" in tables:
