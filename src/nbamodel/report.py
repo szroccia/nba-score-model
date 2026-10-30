@@ -346,14 +346,14 @@ def _label(value) -> str:
     return f"{value:g}" if isinstance(value, float) else str(value)
 
 
-def tuning(tables: dict, out):
-    """Decision 10: one panel per hand-picked setting, in the order tested. Each value's change in
+def tuning(tables: dict, out, what: str = "hand-picked settings"):
+    """Decisions 10 and 12: one panel per setting, in the order tested. Each value's change in
     margin error against the value in use at that step, with the noise. All panels share one
     scale, so a big effect looks big and a small one small."""
     plt = _plt()
     summary = tables["Summary"].set_index("Setting")["Test picked"]
-    panels = [(h, t) for h, t in tables.items() if h != "Summary" and "Value" in t]
-    cols = 4
+    panels = [(h, t) for h, t in tables.items() if "Verdict" in t]
+    cols = min(4, len(panels))
     rows = -(-len(panels) // cols)
     height = 2.9 * rows + 1.6
     fig, axes = plt.subplots(rows, cols, figsize=(11, height), facecolor=SURFACE, sharey=True, squeeze=False)
@@ -375,6 +375,10 @@ def tuning(tables: dict, out):
             ax.plot([x, x], [change - noise, change + noise], color=GRAY, linewidth=6, solid_capstyle="butt")
             ax.scatter([x], [change], s=70, color=ORANGE if label == picked else BLUE,
                        edgecolor=SURFACE, linewidth=2, zorder=3)
+            if label == picked and r["Verdict"] == "better" and change - noise < 0 < change + noise:
+                # A margin tie can still win on total error; say so, or the orange dot looks wrong.
+                ax.annotate("won on total error", (x, change + noise), xytext=(0, 6), textcoords="offset points",
+                            ha="center", fontsize=8.5, color=INK)
         ax.axhline(0, color=MUTED, linewidth=1)
         ax.set_xticks(range(len(labels)), labels)
         ax.set_xlim(-0.6, len(labels) - 0.4)
@@ -384,8 +388,8 @@ def tuning(tables: dict, out):
     axes[0][0].set_ylim(-reach * 1.25, reach * 1.25)
     for row in axes:
         row[0].set_ylabel("Change in margin error, points", fontsize=9, color=MUTED)
-    title = (f"{changed} of {len(panels)} hand-picked settings beat the noise" if changed
-             else "None of the hand-picked settings beat the noise")
+    title = (f"{changed} of {len(panels)} {what} beat the noise" if changed
+             else f"None of the {what} beat the noise")
     _headline(fig, title,
               "Each value against the value in use (open circle) on the same validation games; below zero is "
               "better. Gray bars are the noise (2 standard errors, month to month): a bar crossing zero is a tie, "
@@ -564,6 +568,9 @@ def run(fig_dir=None) -> list:
     made.append(cv_scheme(fig_dir / "evaluation_scheme.png"))
     if (results / "tuning.md").exists():
         made.append(tuning(read_tables(results / "tuning.md"), fig_dir / "tuning.png"))
+    if (results / "ratings_tuning.md").exists():
+        made.append(tuning(read_tables(results / "ratings_tuning.md"), fig_dir / "ratings_tuning.png",
+                           "changes to team ratings"))
     if (results / "comparison.md").exists():
         tables = read_tables(results / "comparison.md")
         made.append(model_comparison(tables["Against ridge regression"], fig_dir / "model_comparison.png"))

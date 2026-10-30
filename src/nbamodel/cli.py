@@ -9,6 +9,7 @@
     python -m nbamodel evaluate         # cross-validation, tuning curves and Vegas benchmark
     python -m nbamodel evaluate --compare all   # plus with/without tables for each setting decision
     python -m nbamodel tune             # test the hand-picked settings one by one (decision 10)
+    python -m nbamodel tune --ratings   # test changes to how team ratings are built (decision 12)
     python -m nbamodel compare          # other kinds of model against ridge regression (decision 11)
     python -m nbamodel injuries         # check what the injury report reader finds
     python -m nbamodel predict          # today's games with the latest injury report
@@ -43,6 +44,8 @@ def _load(seasons: list[str], refresh_season: str | None = None):
     )
     if config.OPPONENT_ADJUST:  # across all seasons at once, so October opponents have a history
         games = ratings.opponent_adjust(games)
+    if config.CUSUM_THRESHOLD:  # after the opponent adjustment, so changes are judged on adjusted games
+        games = ratings.detect_changes(games)
     players = pd.concat(
         [data.player_games(s, refresh=(s == refresh_season)) for s in seasons], ignore_index=True
     )
@@ -244,18 +247,49 @@ TUNING = [
 ]
 
 
+# Decision 12: changes to how team ratings are built (fixed before any results), in this order.
+# The first value of each is the ratings as they were before decision 12.
+RATING_TESTS = [
+    ("Season-start prior", "share of last season's edge kept",
+     [(f"{v:g}", {"SEASON_CARRYOVER": v}) for v in (1.0, 0.8, 0.6, 0.4)]),
+    ("Trend", "share of the recent trend followed", [(f"{v:g}", {"RATING_TREND": v}) for v in (0.0, 0.25, 0.5, 1.0)]),
+    ("Change detection", "CUSUM threshold, net rating points",
+     [("off", {"CUSUM_THRESHOLD": None}), *[(str(v), {"CUSUM_THRESHOLD": v}) for v in (50, 80)]]),
+]
+
+
+def _trade_game_ids() -> set:
+    """Validation games soon after a midseason trade of a rotation player (decision 12's slice)."""
+    _, players = _load(_all_seasons())
+    return evaluate.after_trades(players, EARLY_SEASON_GAMES)
+
+
 def _current_option(options: list) -> str:
     return next(label for label, values in options
                 if all(getattr(config, attr) == v for attr, v in values.items()))
 
 
 def cmd_tune(args):
-    """Decision 10: check each setting in TUNING, in order, against the value in use, with the
-    noise test. A value replaces it only if it is "better" (several: the lowest margin error);
-    the settings after it are then checked with the new value in place. config.py is not
-    changed; results/tuning.md shows what the test picked."""
+    """Decision 10, or decision 12 with --ratings: check each setting in order against the value
+    in use, with the noise test. A value replaces it only if it is "better" (several: the lowest
+    margin error); the settings after it are then checked with the new value in place. config.py
+    is not changed; the results file shows what the test picked."""
+    if args.ratings:
+        _sequential_test(RATING_TESTS, "ratings_tuning", "Better team ratings",
+                         "Decision 12 in docs/decisions.md. Each change to how team ratings are built is checked "
+                         "in this order against the ratings in use", slices=True)
+    else:
+        _sequential_test(TUNING, "tuning", "Tuning the hand-picked settings",
+                         "Decision 10 in docs/decisions.md. Each setting is checked in this order against the "
+                         "value in use")
+    cmd_report(args)
+
+
+def _sequential_test(tests: list, name: str, title: str, opening: str, slices: bool = False) -> None:
+    """The one-pass test behind `tune`. With slices, each step also reports the margin change on
+    early-season games and on games just after a midseason trade (shown, never deciding)."""
     seasons = [s for s in config.TRAIN_SEASONS if s < config.TEST_SEASON]
-    original = {attr: getattr(config, attr) for _, _, options in TUNING for _, values in options for attr in values}
+    original = {attr: getattr(config, attr) for _, _, options in tests for _, values in options for attr in values}
     folds = {}
 
     def cross_validate():
@@ -266,19 +300,26 @@ def cmd_tune(args):
         return folds[key]
 
     k = config.NOISE_STANDARD_ERRORS
-    lines = ["# Tuning the hand-picked settings", "",
-             "Decision 10 in docs/decisions.md. Each setting is checked in this order against the value in use, "
-             f"on the same validation folds. Changes are in average error on the same games; noise is {k} standard "
-             "errors, measured month to month. A value replaces the one in use only if it beats the noise "
-             f"(margin error first, then total error) and doesn't move the average total more than "
+    lines = [f"# {title}", "",
+             f"{opening}, on the same validation folds. Changes are in average error on the same games; noise is "
+             f"{k} standard errors, measured month to month. A value replaces the one in use only if it beats the "
+             "noise (margin error first, then total error) and doesn't move the average total more than "
              f"{config.BIAS_GUARD_POINTS} points further from the actual. Otherwise the value in use stays. "
              "The settings after it are checked with the winner in place.", ""]
+    if slices:
+        feats = _historical(seasons)
+        early = set(feats.groupby("GAME_ID")["SEASON_GAMES"].max().loc[lambda g: g < EARLY_SEASON_GAMES].index)
+        groups = {"Early season": early, "After trades": _trade_game_ids()}
+        lines += [f"Each step also shows the margin change on two slices, which are reported but don't decide: "
+                  f"early season (neither team has played {EARLY_SEASON_GAMES} games yet) and after trades (a "
+                  f"team's first {EARLY_SEASON_GAMES} games after gaining or losing, midseason, a player who "
+                  "averaged 20+ minutes).", ""]
     summary = []
     try:
-        for heading, unit, options in TUNING:
+        for heading, unit, options in tests:
             current = _current_option(options)
             in_use = dict(options)[current]
-            print(f"Tuning {heading.lower()} (in use: {current})...")
+            print(f"Testing {heading.lower()} (in use: {current})...")
             preds = {}
             for label, values in options:
                 for attr, v in values.items():
@@ -308,17 +349,36 @@ def cmd_tune(args):
             edge = picked != current and picked in (options[0][0], options[-1][0])
             lines += ["", f"**{'Changed to ' + picked if picked != current else 'Kept ' + current}.**"
                       + (" The winner is at the end of the values tried." if edge else ""), ""]
+            if slices:
+                lines += _slice_table(heading, options, current, preds, groups)
             summary.append(f"| {heading} | {current} | {picked} |")
     finally:
         for attr, v in original.items():
             setattr(config, attr, v)
     lines += ["## Summary", "", "| Setting | In use before | Test picked |", "| --- | --- | --- |", *summary]
-    out = config.ROOT / "results" / "tuning.md"
+    out = config.ROOT / "results" / f"{name}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(lines) + "\n")
     print("\n".join(lines[-len(summary) - 2:]))
     print(f"Saved {out}")
-    cmd_report(args)
+
+
+def _slice_table(heading: str, options: list, current: str, preds: dict, groups: dict) -> list[str]:
+    """Margin change against the value in use on each slice of games, with its noise."""
+    k = config.NOISE_STANDARD_ERRORS
+    head = "| Setting |" + "".join(f" {g} games | {g}: margin change | {g}: noise |" for g in groups)
+    lines = [f"### {heading}: by slice", "", head, "|" + " --- |" * (1 + 3 * len(groups))]
+    for label, _ in options:
+        cells = [label]
+        for ids in groups.values():
+            base, other = (preds[x][preds[x]["GAME_ID"].isin(ids)] for x in (current, label))
+            if label == current:
+                cells += [str(len(base)), "-", "-"]
+            else:
+                change, se = evaluate.paired_change(base, other, "MARGIN")
+                cells += [str(len(base)), f"{change:+.3f}", f"{k * se:.3f}"]
+        lines.append("| " + " | ".join(cells) + " |")
+    return lines + [""]
 
 
 def cmd_compare(args):
@@ -660,8 +720,10 @@ def main(argv=None):
                              "'all' does every one (repeatable)")
     inj = sub.add_parser("injuries", help="Show what the injury report reader finds")
     inj.add_argument("--file", help="Read a downloaded injury report PDF instead of fetching the latest")
-    sub.add_parser("tune", help="Test the hand-picked settings one by one (decision 10), "
-                   "written to results/tuning.md")
+    p_tune = sub.add_parser("tune", help="Test the hand-picked settings one by one (decision 10), "
+                            "written to results/tuning.md")
+    p_tune.add_argument("--ratings", action="store_true",
+                        help="Test decision 12's changes to team ratings instead (results/ratings_tuning.md)")
     sub.add_parser("compare", help="Other kinds of model against ridge regression (decision 11), "
                    "written to results/comparison.md")
     sub.add_parser("report", help="Redraw the charts in docs/figures from results/ and data/model.json")

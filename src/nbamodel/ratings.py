@@ -91,18 +91,44 @@ def league_average(games: pd.DataFrame, date: pd.Timestamp, season: str) -> dict
     return {k: float(np.average(past[k], weights=w)) for k in ("PACE", "ORTG", *FACTORS) if k in past}
 
 
-def _blend_history(seasons: np.ndarray, values: dict, season: str, league: dict) -> dict:
+def _blend_history(seasons: np.ndarray, values: dict, season: str, league: dict,
+                   weights: np.ndarray | None = None) -> dict:
     """Recency-weighted average of a team's past games (most recent first), shrunk toward
-    the league average. Last season's games count less once the new season has begun."""
+    the league average. Last season's games count less once the new season has begun.
+
+    Decision 12's candidates, when on: last season's games are first pulled toward the league
+    average (SEASON_CARRYOVER), the average follows part of the recent trend (RATING_TREND),
+    and `weights` lowers the games from before a detected change."""
     w = 0.5 ** (np.arange(len(seasons)) / config.RATING_HALF_LIFE_GAMES)
     w = w * np.where(seasons == season, 1.0, config.PRIOR_SEASON_GAME_WEIGHT)
+    if weights is not None:
+        w = w * weights
     shrink = config.SHRINK_GAMES
     total = w.sum() + shrink
     # Defense is shrunk toward the same league average as offense (DRTG to ORTG, OPP_EFG_PCT to EFG_PCT).
     prior = {k: league["ORTG"] if k == "DRTG" else league[k.removeprefix("OPP_")] for k in values}
     if total == 0:  # no games yet and no shrinkage (SHRINK_GAMES = 0): the league average is all there is
         return {k: float(prior[k]) for k in values}
+    if config.SEASON_CARRYOVER != 1:
+        old = seasons != season
+        values = {k: np.where(old, prior[k] + config.SEASON_CARRYOVER * (v - prior[k]), v) for k, v in values.items()}
+    if config.RATING_TREND and w.sum() > 0:
+        return {k: float((w.sum() * _with_trend(w, v) + shrink * prior[k]) / total) for k, v in values.items()}
     return {k: float((np.dot(w, v) + shrink * prior[k]) / total) for k, v in values.items()}
+
+
+def _with_trend(w: np.ndarray, v: np.ndarray) -> float:
+    """The weighted average of v, moved RATING_TREND of the way to where a straight line fitted
+    through the same games with the same weights stands at the next game. Fitting that line is
+    Brown's double exponential smoothing (Holt's method with one smoothing rate); the share
+    damps the trend so one hot week can't run away with a rating."""
+    t = -1.0 - np.arange(len(v))  # games ago, most recent first; the next game is at 0
+    mean_t, mean_v = w @ t / w.sum(), w @ v / w.sum()
+    spread = w @ (t - mean_t) ** 2
+    if spread == 0:
+        return float(mean_v)
+    slope = w @ ((t - mean_t) * (v - mean_v)) / spread
+    return float(mean_v - config.RATING_TREND * slope * mean_t)
 
 
 def team_rating(games: pd.DataFrame, team_id: int, date: pd.Timestamp, season: str,
@@ -117,12 +143,20 @@ def team_rating(games: pd.DataFrame, team_id: int, date: pd.Timestamp, season: s
         & games["SEASON"].isin(_seasons_in_window(season))
     ].sort_values("GAME_DATE", ascending=False)
     suffix = "_ADJ" if "ORTG_ADJ" in games else ""
+    # With change detection on, games from before the latest change the team's games so far
+    # reveal count less (detect_changes; only this season's changes are carried).
+    weights = None
+    if "CHANGE_START" in past and len(past) and past["SEASON"].iloc[0] == season:
+        change = past["CHANGE_START"].iloc[0]
+        if pd.notna(change):
+            weights = np.where(past["GAME_DATE"] < change, config.CHANGE_GAME_WEIGHT, 1.0)
     rating = _blend_history(
         past["SEASON"].to_numpy(),
         {**{k: past[k + suffix].to_numpy() for k in ("PACE", "ORTG", "DRTG")},
          **{k: past[k].to_numpy() for k in (*FACTORS, *OPP_FACTORS) if k in past}},
         season,
         league,
+        weights,
     )
     rating["GAMES"] = int(len(past))
     rating["CURRENT_GAMES"] = int((past["SEASON"] == season).sum())
@@ -170,6 +204,52 @@ def opponent_adjust(games: pd.DataFrame) -> pd.DataFrame:
                 history.setdefault(teams[i], []).append(i)
     for k in ("PACE", "ORTG", "DRTG"):
         df[k + "_ADJ"] = adj[k]
+    return df
+
+
+def detect_changes(games: pd.DataFrame) -> pd.DataFrame:
+    """Add CHANGE_START: for each team-game, the date the team's most recent real change in level
+    began, as a CUSUM finds it from this game and earlier ones in the same season (NaT if none).
+
+    Each game's residual is the team's net rating (points per 100 possessions, opponent-adjusted
+    when available) minus its rating going in, built the same way team ratings are. Residuals
+    beyond CUSUM_SLACK add up, separately upward and downward. When either total passes
+    CUSUM_THRESHOLD, a change is flagged, starting with the game after that total last stood at
+    zero, and both totals restart. Until the rating catches up, the totals can pass the threshold
+    again in the same direction; that is the same change, so it keeps its first date. A new season
+    starts with no change, since the season-start weighting already handles the offseason."""
+    df = games.sort_values(["GAME_DATE", "GAME_ID", "TEAM_ID"]).reset_index(drop=True)
+    suffix = "_ADJ" if "ORTG_ADJ" in df else ""
+    net = (df["ORTG" + suffix] - df["DRTG" + suffix]).to_numpy(dtype=float)
+    dates, seasons = df["GAME_DATE"].to_numpy(), df["SEASON"].to_numpy()
+    used = _rating_games(df)
+    start = np.full(len(df), np.datetime64("NaT", "ns"))
+    for rows in used.groupby("TEAM_ID").indices.values():
+        rows = used.index.to_numpy()[rows]  # positions in df, oldest first
+        season = change = None
+        for j, i in enumerate(rows):
+            if seasons[i] != season:
+                season, change, direction, up, down = seasons[i], None, 0, 0.0, 0.0
+                window = list(_seasons_in_window(season))
+            past = rows[:j][::-1]
+            past = past[np.isin(seasons[past], window)]
+            weights = None if change is None else np.where(dates[past] < change, config.CHANGE_GAME_WEIGHT, 1.0)
+            expected = _blend_history(seasons[past], {"NET": net[past]}, season, {"NET": 0.0}, weights)["NET"]
+            residual = net[i] - expected
+            if up == 0:
+                up_from = i
+            if down == 0:
+                down_from = i
+            up = max(0.0, up + residual - config.CUSUM_SLACK)
+            down = max(0.0, down - residual - config.CUSUM_SLACK)
+            if max(up, down) > config.CUSUM_THRESHOLD:
+                flagged = 1 if up > down else -1
+                if flagged != direction:
+                    change, direction = dates[up_from if flagged == 1 else down_from], flagged
+                up = down = 0.0
+            if change is not None:
+                start[i] = change
+    df["CHANGE_START"] = start
     return df
 
 

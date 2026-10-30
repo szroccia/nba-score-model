@@ -20,6 +20,23 @@ PRIOR_SEASON_GAME_WEIGHT = 0.4     # last season's games count less once a new s
 #   "relative" - use them, measured against the playoff league average instead of the regular season's
 PLAYOFF_GAMES = "include"   # original behavior; change once the comparison backtest picks a winner
 SHRINK_GAMES = 4                   # pseudo-games of league average added to every rating
+# Decision 12 tests three changes to how ratings are built. Each is off (the values below) until
+# the test settles it (docs/decisions.md):
+# - Season-start prior: share of a team's edge over the league average that last season's games
+#   keep once a new season starts (1 = all of it). Below 1, last season is pulled toward average
+#   first: regression to the mean.
+SEASON_CARRYOVER = 1.0
+# - Trend: share of the recent trend a rating follows (0 = a flat recency-weighted average). Above
+#   0, the rating moves toward where a weighted straight line through the same games is heading.
+RATING_TREND = 0.0
+# - Change detection: a CUSUM on each team's net rating (points per 100 possessions) against its
+#   rating going in. Residuals beyond the slack add up; past the threshold, a real change is
+#   flagged and games before it count CHANGE_GAME_WEIGHT as much. None = off.
+# Decision 12 kept the first two off and turned change detection on at 80 (it beat the noise on
+# total error).
+CUSUM_THRESHOLD = 80
+CUSUM_SLACK = 4.0
+CHANGE_GAME_WEIGHT = 0.4
 # Strength of schedule: correct each game for how good the opponent was going into it.
 # On since decision 8 (docs/decisions.md): it beat the noise on margin error.
 OPPONENT_ADJUST = True

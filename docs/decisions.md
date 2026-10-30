@@ -17,6 +17,7 @@ The major modeling choices, what was considered, the evidence and the reason for
 | 9 | [Four factors](#9-four-factors) | Left out | Worse on margin error beyond the noise, though better on totals |
 | 10 | [Hand-picked settings](#10-hand-picked-settings) | Rating half-life 24, minutes half-life 12, replacement level -3; five others kept | Beat the noise on margin error; total error rose 0.11 |
 | 11 | [Kinds of model](#11-kinds-of-model) | Ridge regression stays | Five flexible models were worse on margin error beyond the noise; elastic net and a blend tied |
+| 12 | [Better team ratings](#12-better-team-ratings) | Change detection (CUSUM) at 80; season-start prior and trend left out | CUSUM beat the noise on total error, with margin a tie; the others tied or were worse |
 
 ---
 
@@ -78,11 +79,11 @@ In October, team ratings are mostly last season's games, so this is what account
 - **A rule fixed in advance:** settings are ranked by margin error, then total error, then total bias nearest zero, with near-ties going to the simpler model. From decision 8 on, "near tie" has a measured meaning: a change within the noise (see [decision 8](#8-strength-of-schedule)).
 - **A real bar to beat:** the closing line is the best public forecast.
 
-**Evidence.** On 2,620 validation games the model (as of decision 10) trails Vegas by about a quarter of a point on margin error and half a point on total error:
+**Evidence.** On 2,620 validation games the model (as of decision 12) trails Vegas by about a quarter of a point on margin error and half a point on total error:
 
 | | Margin error | Total error | Winners picked |
 | --- | --- | --- | --- |
-| Model | 10.85 | 14.66 | 67.6% |
+| Model | 10.86 | 14.63 | 67.2% |
 | Vegas closing line | 10.62 | 14.15 | 68.7% |
 
 ![Model vs Vegas by month](figures/vegas_by_month.png)
@@ -305,3 +306,48 @@ Elastic net, k-nearest neighbors, support vector regression and the neural netwo
 - **Luck.** Nothing passed, so there is no lucky winner to worry about (point 7). The locked test season stays untouched.
 
 ![Training and validation error by kind of model](figures/model_fit.png)
+
+---
+
+## 12. Better team ratings
+
+**Question.** Team ratings are a recency-weighted average of past games (half-life 24 games), with last season's games counted at 40% and 4 games of league average mixed in. Three ideas from time-series analysis could build them differently. Would any of them predict better?
+
+| # | Change | What it does | In use | Values tried |
+| --- | --- | --- | --- | --- |
+| 1 | Season-start prior (`SEASON_CARRYOVER`) | Bayesian regression to the mean: before last season's games count toward a new season, they are pulled toward the league average, keeping this share of a team's edge | 1 (all of it) | 1, 0.8, 0.6, 0.4 |
+| 2 | Trend (`RATING_TREND`) | Holt-style smoothing: fit a weighted straight line through the same games, then move the rating this share of the way to where the line is heading | 0 (a flat average) | 0, 0.25, 0.5, 1 |
+| 3 | Change detection (`CUSUM_THRESHOLD`) | A CUSUM adds up how far a team's net rating runs above or below its rating, beyond a slack of 4 points a game. Past the threshold, it flags a real change, and the games before it count 40% as much | off | off, 50, 80 |
+
+**Why they might help, and why they might not.** Regression to the mean is the classic correction for small samples: part of any team's edge last season was luck. A trend lets a rating keep up with a team that is steadily improving or fading. Change detection reacts to sudden shifts, such as a coaching change or an injury the lineup inputs don't capture. But decision 10 found that longer memory helps, and a trend or a reset both make ratings react faster, so small or negative effects are as likely as gains.
+
+**Settings fixed with the candidates,** not tested: the CUSUM slack (4 points of net rating per 100 possessions, per game) and the weight of games before a change (0.4, the same as last season's games). A second flag in the same direction while the rating catches up counts as the same change. In a simulation with NBA-like game-to-game noise, a threshold of 50 flags a steady team about twice a season by chance, and 80 about once every three seasons. Either one flags a real 8-point shift after about 15 games.
+
+**Test fixed in advance,** written down before any results existed (October 30, 2026). `python -m nbamodel tune --ratings` runs it and writes [results/ratings_tuning.md](../results/ratings_tuning.md):
+
+1. Check the three in the order of the table. The season-start prior goes first because it shapes the start of every season. Change detection goes last because it reacts to how the ratings miss.
+2. Score every value on the same validation months as the value in use, with the noise test from decisions 8 to 11. Margin error decides first, then total error; a change must exceed 2 standard errors, measured month to month; and the bias guard applies.
+3. A value replaces the one in use only if it is better beyond the noise. If several are, the lowest margin error wins. Ties keep the ratings in use, which are the simplest.
+4. Later changes are checked with earlier winners in place. There is one pass, so the number of comparisons is fixed at 8.
+5. **All games decide** (Steve, October 30, 2026). Two slices are reported for every value but don't decide: early season (games where neither team has played 15 games yet) and after trades (a team's first 15 games after gaining or losing, midseason, a player who averaged 20 or more minutes). Games a change barely touches add almost nothing to a paired test, so all games already judge a targeted change fairly.
+6. **Luck.** Each comparison has about a 1 in 20 chance of passing by luck alone. Across 8, there's about a 1 in 3 chance that one does. The locked test season, scored once at the end, has the last word.
+7. If a winner sits at the end of its range, the write-up says so. Trying values beyond it would be a new test.
+
+**What this test can't check.** Change detection changes a team's own rating only; the strength-of-schedule adjustment keeps judging opponents the current way. The season-start prior and the trend apply to both.
+
+**Result (October 30, 2026).** Full tables are in [results/ratings_tuning.md](../results/ratings_tuning.md). One of the three changes beat the noise, narrowly:
+
+| Change | Value picked | Margin change | Margin noise | Total change | Total noise |
+| --- | --- | --- | --- | --- | --- |
+| Change detection | threshold 80 | +0.009 | 0.023 | -0.036 | 0.033 |
+
+- **Season-start prior: left out.** Every value tied on all games, and pulling last season toward the average hurt the early-season games it targets: keeping 40% of the edge raised early-season margin error by 0.25 (noise 0.16). A likely reason: the lineup inputs already adjust for who left and who arrived, so most of what remains of last season's edge is real.
+- **Trend: left out.** Following half or all of the trend was worse on margin beyond the noise, and a quarter tied. The trend likely chases noise: a team's last few weeks are mostly luck, and decision 10 found that longer memory helps.
+- **Change detection: threshold 80 picked.** It tied on margin (+0.009) and beat the noise on total error (-0.036 against 0.033), with total bias +0.06 instead of +0.08. Threshold 50, which flags a steady team about twice a season by chance, was worse on margin. Both slices tied.
+
+**Choice (Steve, October 30, 2026): turn change detection on at 80,** as the rule fixed in advance says. `CUSUM_THRESHOLD` is 80, and the model is retrained with it. After retraining, on the validation games: margin error 10.85 → 10.86, total error 14.67 → 14.64, winners picked 67.5% → 67.1%, total bias +0.08 → +0.06.
+- **It won by a hair, and on totals.** Its margin error is a tie. It counts as better because the rule lets total error decide when margin ties, the same rule as every decision since 8.
+- **End of the range.** Of the values tried, the threshold that flags least did best. "Off" lies further in that direction, so a higher threshold might do better still. Trying one would be a new test.
+- **Luck.** With 8 comparisons, there's about a 1 in 3 chance of one lucky pass (point 6), and this pass is narrow. The locked test season has the last word.
+
+![Changes to team ratings](figures/ratings_tuning.png)

@@ -10,7 +10,7 @@ Validation seasons 2023-24 and 2024-25, 2,620 games. Each month is predicted by 
 
 | | Margin error (points) | Total error (points) | Winners picked |
 | --- | --- | --- | --- |
-| This model | 10.85 | 14.66 | 67.6% |
+| This model | 10.86 | 14.63 | 67.2% |
 | Vegas closing line | 10.62 | 14.15 | 68.7% |
 
 ![Model vs Vegas by month](docs/figures/vegas_by_month.png)
@@ -34,7 +34,7 @@ flowchart LR
 Each team's points come from four ideas:
 
 1. **Pace.** How many possessions the game will have, from both teams' recent pace.
-2. **Efficiency.** The team's offensive rating (points per 100 possessions) against the opponent's defensive rating, weighted toward recent games. Each past game is corrected for how good that opponent was, so a team with a hard schedule isn't underrated.
+2. **Efficiency.** The team's offensive rating (points per 100 possessions) against the opponent's defensive rating, weighted toward recent games. Each past game is corrected for how good that opponent was, so a team with a hard schedule isn't underrated. When a team's results shift sharply, a change detector (CUSUM) flags it and the games before the shift count less.
 3. **Tonight's lineup.** Who is in and out. Each player's Box Plus/Minus is weighed against the minutes he is expected to play tonight compared with recent games, so a star sitting out lowers his team's offense and defense.
 4. **Context.** Home court, days of rest and back-to-backs.
 
@@ -52,7 +52,7 @@ The regression then adds the adjustments for lineups, home court and rest. `pyth
 
 ![Model coefficients](docs/figures/coefficients.png)
 
-The formula is taken at face value (about 1.00). Home court is worth about 2 points, and facing a team on the second night of a back-to-back about 1. The coefficients are saved in `data/model.json`, and every tunable setting (rating half-life, injury status probabilities, replacement-level BPM and so on) is in `src/nbamodel/config.py`.
+The formula is taken almost at face value (about 0.98). Home court is worth about 2 points, and facing a team on the second night of a back-to-back about 1. The coefficients are saved in `data/model.json`, and every tunable setting (rating half-life, injury status probabilities, replacement-level BPM and so on) is in `src/nbamodel/config.py`.
 
 | Feature | Meaning |
 | --- | --- |
@@ -108,6 +108,7 @@ Each is explained with its evidence in the [decision log](docs/decisions.md):
 - [Four factors](docs/decisions.md#9-four-factors), tested and left out: they helped totals but hurt margins
 - [Hand-picked settings tuned](docs/decisions.md#10-hand-picked-settings): 3 of 8 changed after a test fixed in advance, with longer memory for team ratings and player minutes
 - [Ridge regression kept over seven other kinds of model](docs/decisions.md#11-kinds-of-model): a neural network, gradient boosting, random forest and others fit past games better but predicted new months worse
+- [Better team ratings](docs/decisions.md#12-better-team-ratings): change detection (CUSUM) added after a test fixed in advance; a season-start prior and a trend were tested and left out
 
 ## Data
 
@@ -140,6 +141,7 @@ python -m nbamodel evaluate      # cross-validation, tuning curves, Vegas benchm
 python -m nbamodel evaluate --compare all   # adds a with/without table for each setting decision
 python -m nbamodel tune          # tests the hand-picked settings one by one (results/tuning.md)
 python -m nbamodel compare       # other kinds of model against ridge regression (results/comparison.md)
+python -m nbamodel tune --ratings # tests changes to how team ratings are built (results/ratings_tuning.md)
 python -m nbamodel report        # redraw the charts in docs/figures
 python -m nbamodel predict       # today's games
 python -m nbamodel explain --game BOS   # chart of how one game's prediction is built

@@ -934,3 +934,123 @@ def test_compare_command_finds_a_model_that_beats_ridge(monkeypatch, tmp_path):
     assert weights["Gradient boosting"] > weights["k-nearest neighbors"]
     for name in ("model_comparison", "model_fit"):
         assert (tmp_path / "docs" / "figures" / f"{name}.png").stat().st_size > 10_000
+
+
+def test_rating_changes_left_out_keep_saved_features(monkeypatch):
+    from nbamodel import config
+
+    # Decision 12 left these two out; while off they stay out of the feature fingerprint.
+    assert (config.SEASON_CARRYOVER, config.RATING_TREND) == (1.0, 0.0)
+    assert not {"season_carryover", "rating_trend"} & set(features.settings())
+    assert features.settings()["cusum"] == [80, 4.0, 0.4]   # change detection on since decision 12
+    monkeypatch.setattr(config, "CUSUM_THRESHOLD", None)
+    assert "cusum" not in features.settings()
+
+
+def test_season_carryover_pulls_last_season_toward_average(monkeypatch):
+    from nbamodel import config
+
+    league = {"PACE": 100.0, "ORTG": 110.0}
+    old = np.array(["2023-24"] * 30)
+    values = {"PACE": np.full(30, 100.0), "ORTG": np.full(30, 120.0), "DRTG": np.full(30, 110.0)}
+    full = ratings._blend_history(old, values, "2024-25", league)["ORTG"]
+    monkeypatch.setattr(config, "SEASON_CARRYOVER", 0.5)
+    half = ratings._blend_history(old, values, "2024-25", league)["ORTG"]
+    assert full - 110 == pytest.approx(2 * (half - 110))
+    # This season's games are not pulled.
+    new = np.array(["2024-25"] * 30)
+    monkeypatch.setattr(config, "SEASON_CARRYOVER", 1.0)
+    same = ratings._blend_history(new, values, "2024-25", league)["ORTG"]
+    monkeypatch.setattr(config, "SEASON_CARRYOVER", 0.5)
+    assert ratings._blend_history(new, values, "2024-25", league)["ORTG"] == pytest.approx(same)
+
+
+def test_trend_follows_a_team_that_keeps_improving(monkeypatch):
+    from nbamodel import config
+
+    league = {"PACE": 100.0, "ORTG": 110.0}
+    seasons = np.array(["2024-25"] * 40)
+    improving = 130 - 0.5 * np.arange(40)  # most recent first: up half a point a game
+    values = {"PACE": np.full(40, 100.0), "ORTG": improving, "DRTG": np.full(40, 110.0)}
+    flat = ratings._blend_history(seasons, values, "2024-25", league)
+    monkeypatch.setattr(config, "RATING_TREND", 1.0)
+    trend = ratings._blend_history(seasons, values, "2024-25", league)
+    monkeypatch.setattr(config, "RATING_TREND", 0.5)
+    half = ratings._blend_history(seasons, values, "2024-25", league)
+    assert flat["ORTG"] < half["ORTG"] < trend["ORTG"]
+    assert half["ORTG"] - flat["ORTG"] == pytest.approx((trend["ORTG"] - flat["ORTG"]) / 2)
+    assert trend["PACE"] == pytest.approx(flat["PACE"])  # no trend, no change
+
+
+def _one_team_season(levels):
+    """One team's games in one season, net rating (ORTG - DRTG) at the given levels, no noise."""
+    days = pd.date_range("2024-10-22", periods=len(levels), freq="2D")
+    return pd.DataFrame({"GAME_ID": range(len(levels)), "GAME_DATE": days, "SEASON": "2024-25", "TEAM_ID": 1,
+                         "OPP_TEAM_ID": 2, "PLAYOFF": False, "PACE": 100.0,
+                         "ORTG": 110.0 + np.asarray(levels, dtype=float), "DRTG": 110.0})
+
+
+def test_change_detection_flags_a_real_jump_and_rating_catches_up(monkeypatch):
+    from nbamodel import config
+
+    monkeypatch.setattr(config, "CUSUM_THRESHOLD", 50)
+    games = _one_team_season([0] * 40 + [20] * 15)
+    flagged = ratings.detect_changes(games)
+    jump = games["GAME_DATE"].iloc[40]
+    assert flagged["CHANGE_START"].iloc[:40].isna().all()          # a steady team is never flagged
+    assert (flagged["CHANGE_START"].iloc[44:] == jump).all()        # flagged within a few games, dated to the jump
+    league = {"PACE": 100.0, "ORTG": 110.0}
+    after = games["GAME_DATE"].iloc[-1] + pd.Timedelta(days=1)
+    with_cusum = ratings.team_rating(flagged, 1, after, "2024-25", league)["ORTG"]
+    without = ratings.team_rating(games, 1, after, "2024-25", league)["ORTG"]
+    assert without < with_cusum < 130                               # closer to the new level
+    # Falling back again is a new change, in the other direction, with its own date.
+    back = ratings.detect_changes(_one_team_season([0] * 40 + [20] * 30 + [0] * 15))
+    assert back["CHANGE_START"].iloc[-1] == back["GAME_DATE"].iloc[70]
+
+
+def test_after_trades_marks_both_teams_next_games():
+    from nbamodel import evaluate
+
+    rows = []
+    for g in range(60):
+        date = pd.Timestamp("2024-11-01") + pd.Timedelta(days=2 * g)
+        for team in (1, 2):
+            gid = 1000 * team + g
+            rows.append({"GAME_ID": gid, "GAME_DATE": date, "SEASON": "2024-25", "TEAM_ID": team, "PLAYER_ID": 100 + team, "MIN": 30})
+            # Player 7 plays 30 minutes for team 1 until game 29, then for team 2; player 8, a 10-minute
+            # bench player, makes the same move and doesn't count.
+            for player, minutes in ((7, 30), (8, 10)):
+                if (team == 1) == (g < 30):
+                    rows.append({"GAME_ID": gid, "GAME_DATE": date, "SEASON": "2024-25", "TEAM_ID": team,
+                                 "PLAYER_ID": player, "MIN": minutes})
+    ids = evaluate.after_trades(pd.DataFrame(rows), window=15)
+    assert ids == {1000 + g for g in range(30, 45)} | {2000 + g for g in range(30, 45)}
+
+
+def test_tune_ratings_reports_slices_and_restores_config(monkeypatch, tmp_path):
+    from nbamodel import cli, config, report
+
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "VALIDATION_SEASONS", ["2023-24", "2024-25"])
+    monkeypatch.setattr(config, "TEST_SEASON", "2025-26")
+    monkeypatch.setattr(config, "CUSUM_THRESHOLD", None)  # the test as it ran, before decision 12 turned it on
+    plain = _fake_features()
+    seen = []
+
+    def historical(seasons):
+        seen.append((config.SEASON_CARRYOVER, config.RATING_TREND, config.CUSUM_THRESHOLD))
+        return plain
+
+    monkeypatch.setattr(cli, "_historical", historical)
+    monkeypatch.setattr(cli, "_trade_game_ids", lambda: set(plain["GAME_ID"].iloc[::7]))
+    cli.main(["tune", "--ratings"])
+    tables = report.read_tables(tmp_path / "results" / "ratings_tuning.md")
+    assert list(tables["Summary"]["Test picked"]) == [1, 0, "off"]  # identical features: every change ties
+    slices = tables["Trend: by slice"]
+    assert list(slices.columns[:4]) == ["Setting", "Early season games", "Early season: margin change",
+                                        "Early season: noise"]
+    assert slices["Early season games"].iloc[0] > 0 and slices["After trades games"].iloc[0] > 0
+    assert (0.4, 0.0, None) in seen and (1.0, 0.0, 80) in seen      # every value was built
+    assert (config.SEASON_CARRYOVER, config.RATING_TREND, config.CUSUM_THRESHOLD) == (1.0, 0.0, None)
+    assert (tmp_path / "docs" / "figures" / "ratings_tuning.png").stat().st_size > 10_000

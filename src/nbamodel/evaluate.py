@@ -125,6 +125,31 @@ def noise_test(base: pd.DataFrame, other: pd.DataFrame) -> dict:
     return out
 
 
+def after_trades(players: pd.DataFrame, window: int = 15, minutes: float = 20) -> set:
+    """Games played within `window` games after a team gained or lost, during a season, a player
+    who averaged at least `minutes` for the team he left (a midseason trade of a rotation player).
+    Offseason moves are left out; they show in the early-season games instead."""
+    stints = (players.groupby(["SEASON", "PLAYER_ID", "TEAM_ID"])
+              .agg(first=("GAME_DATE", "min"), last=("GAME_DATE", "max"), avg_min=("MIN", "mean"))
+              .reset_index().sort_values(["SEASON", "PLAYER_ID", "first"]))
+    before = stints.groupby(["SEASON", "PLAYER_ID"]).shift(1)
+    moved = before["TEAM_ID"].notna() & (before["avg_min"] >= minutes)
+    # The team he joined, from his first game there; the team he left, from the game after his last.
+    events = pd.concat([
+        pd.DataFrame({"TEAM_ID": stints.loc[moved, "TEAM_ID"], "SEASON": stints.loc[moved, "SEASON"],
+                      "FROM": stints.loc[moved, "first"]}),
+        pd.DataFrame({"TEAM_ID": before.loc[moved, "TEAM_ID"].astype(int), "SEASON": stints.loc[moved, "SEASON"],
+                      "FROM": before.loc[moved, "last"] + pd.Timedelta(days=1)}),
+    ])
+    team_games = players.drop_duplicates(["GAME_ID", "TEAM_ID"]).sort_values("GAME_DATE")
+    ids = set()
+    for e in events.itertuples():
+        later = team_games[(team_games["TEAM_ID"] == e.TEAM_ID) & (team_games["SEASON"] == e.SEASON)
+                           & (team_games["GAME_DATE"] >= e.FROM)]
+        ids.update(later["GAME_ID"].head(window))
+    return ids
+
+
 def validation_rows(feats: pd.DataFrame) -> pd.DataFrame:
     """Everything except the locked test season (and anything after it)."""
     start = feats.loc[feats["SEASON"] == config.TEST_SEASON, "GAME_DATE"].min()

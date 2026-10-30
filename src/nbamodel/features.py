@@ -47,6 +47,11 @@ def settings() -> dict:
         "minutes_half_life": config.MINUTES_HALF_LIFE_GAMES,
         "rotation_minutes": config.ROTATION_MINUTES,
         "max_rest_days": config.MAX_REST_DAYS,
+        # Decision 12's candidates are named only when on, so features saved before them stay valid.
+        **({"season_carryover": config.SEASON_CARRYOVER} if config.SEASON_CARRYOVER != 1 else {}),
+        **({"rating_trend": config.RATING_TREND} if config.RATING_TREND else {}),
+        **({"cusum": [config.CUSUM_THRESHOLD, config.CUSUM_SLACK, config.CHANGE_GAME_WEIGHT]}
+           if config.CUSUM_THRESHOLD else {}),
         "active_window_games": lineup.ACTIVE_WINDOW_GAMES,
         "team_minutes": lineup.TEAM_MINUTES,
     }
