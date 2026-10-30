@@ -11,6 +11,7 @@
     python -m nbamodel tune             # test the hand-picked settings one by one (decision 10)
     python -m nbamodel tune --ratings   # test changes to how team ratings are built (decision 12)
     python -m nbamodel compare          # other kinds of model against ridge regression (decision 11)
+    python -m nbamodel probability      # win probability, score ranges, cover and over/under odds (decision 13)
     python -m nbamodel injuries         # check what the injury report reader finds
     python -m nbamodel predict          # today's games with the latest injury report
     python -m nbamodel daily            # refresh this season's data, then predict
@@ -25,7 +26,8 @@ from datetime import date as date_cls
 
 import pandas as pd
 
-from . import compare, config, data, evaluate, features, injuries, lineup, model, ratings, report, validate, vegas
+from . import (compare, config, data, evaluate, features, injuries, lineup, model, probability, ratings, report,
+               validate, vegas)
 from .names import normalize_name
 
 
@@ -61,7 +63,7 @@ def cmd_fetch(args):
         data.bpm(season, refresh=True)
     data.schedule(current, refresh=True)
     data.rosters(current, refresh=True)
-    for season in _evaluation_seasons():
+    for season in sorted(set(_evaluation_seasons()) | set(probability.record_seasons())):
         vegas.lines(season)  # past seasons don't change, so these download once
     print(f"Saved to {config.DATA_DIR}")
 
@@ -94,11 +96,16 @@ def cmd_train(args):
     feats = _historical(config.TRAIN_SEASONS)
     fitted = model.fit(feats)
     fitted["playoff_games"] = config.PLAYOFF_GAMES
+    print("Fitting win probabilities on the model's misses, month by month (under a minute)...")
+    lines_ = None
+    if config.COVER_ODDS or config.OVER_UNDER_ODDS:  # calibrated odds learn from past lines
+        lines_ = _vegas_lines(probability.record_seasons())
+    abbr = vegas.team_abbreviations() if lines_ is not None else None
+    fitted["probability"] = probability.fit_live(feats, abbr, lines_)
     model.save(fitted)
     print(json.dumps(fitted, indent=2))
 
 
-EARLY_SEASON_GAMES = 15
 TABLE_HEADER = ["| Season | Model | Games | Team points MAE | Margin MAE | Total MAE | Winner % | Total bias |",
                 "| --- | --- | --- | --- | --- | --- | --- | --- |"]
 
@@ -118,9 +125,10 @@ def _backtest_rows(label: str = "") -> list[str]:
         test["FORMULA_PTS"] = test["BASE_PTS"] + 1.2 * (2 * test["IS_HOME"] - 1)
         # Early season: games where neither team had played EARLY_SEASON_GAMES games yet,
         # so ratings still lean on last season.
-        early_ids = test.groupby("GAME_ID")["SEASON_GAMES"].max().loc[lambda g: g < EARLY_SEASON_GAMES].index
+        early_ids = test.groupby("GAME_ID")["SEASON_GAMES"].max().loc[lambda g: g < config.EARLY_SEASON_GAMES].index
         runs = [("Ridge (B)", "PRED_PTS", test), ("Formula (A)", "FORMULA_PTS", test),
-                (f"Ridge (B), first {EARLY_SEASON_GAMES} games", "PRED_PTS", test[test["GAME_ID"].isin(early_ids)])]
+                (f"Ridge (B), first {config.EARLY_SEASON_GAMES} games", "PRED_PTS",
+                 test[test["GAME_ID"].isin(early_ids)])]
         for name, col, rows in runs:
             if rows.empty:
                 continue
@@ -146,7 +154,7 @@ def cmd_backtest(args):
         lines += _backtest_rows()
         out = config.ROOT / "results" / "backtest.md"
     out.parent.mkdir(exist_ok=True)
-    out.write_text("\n".join(lines) + "\n")
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("\n".join(lines))
 
 
@@ -154,9 +162,9 @@ def _evaluation_seasons() -> list[str]:
     return sorted(set(config.VALIDATION_SEASONS) | {config.TEST_SEASON})
 
 
-def _vegas_lines() -> pd.DataFrame | None:
+def _vegas_lines(seasons: list[str] | None = None) -> pd.DataFrame | None:
     try:
-        return pd.concat([vegas.lines(s) for s in _evaluation_seasons()], ignore_index=True)
+        return pd.concat([vegas.lines(s) for s in seasons or _evaluation_seasons()], ignore_index=True)
     except Exception as e:  # the benchmark is optional; the rest of the evaluation still runs
         print(f"Could not load Vegas lines ({e}); skipping the benchmark.")
         return None
@@ -261,7 +269,7 @@ RATING_TESTS = [
 def _trade_game_ids() -> set:
     """Validation games soon after a midseason trade of a rotation player (decision 12's slice)."""
     _, players = _load(_all_seasons())
-    return evaluate.after_trades(players, EARLY_SEASON_GAMES)
+    return evaluate.after_trades(players, config.EARLY_SEASON_GAMES)
 
 
 def _current_option(options: list) -> str:
@@ -308,11 +316,11 @@ def _sequential_test(tests: list, name: str, title: str, opening: str, slices: b
              "The settings after it are checked with the winner in place.", ""]
     if slices:
         feats = _historical(seasons)
-        early = set(feats.groupby("GAME_ID")["SEASON_GAMES"].max().loc[lambda g: g < EARLY_SEASON_GAMES].index)
+        early = set(feats.groupby("GAME_ID")["SEASON_GAMES"].max().loc[lambda g: g < config.EARLY_SEASON_GAMES].index)
         groups = {"Early season": early, "After trades": _trade_game_ids()}
         lines += [f"Each step also shows the margin change on two slices, which are reported but don't decide: "
-                  f"early season (neither team has played {EARLY_SEASON_GAMES} games yet) and after trades (a "
-                  f"team's first {EARLY_SEASON_GAMES} games after gaining or losing, midseason, a player who "
+                  f"early season (neither team has played {config.EARLY_SEASON_GAMES} games yet) and after trades (a "
+                  f"team's first {config.EARLY_SEASON_GAMES} games after gaining or losing, midseason, a player who "
                   "averaged 20+ minutes).", ""]
     summary = []
     try:
@@ -358,7 +366,7 @@ def _sequential_test(tests: list, name: str, title: str, opening: str, slices: b
     lines += ["## Summary", "", "| Setting | In use before | Test picked |", "| --- | --- | --- |", *summary]
     out = config.ROOT / "results" / f"{name}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text("\n".join(lines) + "\n")
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("\n".join(lines[-len(summary) - 2:]))
     print(f"Saved {out}")
 
@@ -401,8 +409,26 @@ def cmd_compare(args):
             "wins.", ""]
     out = config.ROOT / "results" / "comparison.md"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text("\n".join(head + lines) + "\n")
+    out.write_text("\n".join(head + lines) + "\n", encoding="utf-8")
     print("\n".join(lines[:len(compare.CANDIDATES) + 7]))  # the table and the result
+    print(f"Saved {out}")
+    cmd_report(args)
+
+
+def cmd_probability(args):
+    """Decision 13: win probability, score ranges, and cover and over/under odds, each month fit only
+    on the model's misses in earlier months. Nothing in the predictions changes; results/probability.md
+    shows what the test picked."""
+    seasons = probability.record_seasons()
+    feats = evaluate.validation_rows(_historical(seasons))
+    lines_ = _vegas_lines(seasons)
+    abbr = vegas.team_abbreviations() if lines_ is not None else None
+    print("Fitting probabilities month by month (about a minute)...")
+    text, _ = probability.run(feats, abbr, lines_)
+    out = config.ROOT / "results" / "probability.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(text) + "\n", encoding="utf-8")
+    print("\n".join(line for line in text if line.startswith("**")))  # what the test found
     print(f"Saved {out}")
     cmd_report(args)
 
@@ -530,6 +556,10 @@ def predict_date(day: pd.Timestamp, use_injury_report: bool = True, refresh: boo
     roster = data.rosters(season, refresh=refresh).groupby("TEAM_ID")["PLAYER_ID"].apply(set)
     league = ratings.league_average(games, day, season)
     fitted = model.load()
+    chances = fitted.get("probability")
+    if chances is None:
+        print("Note: data/model.json has no win probabilities yet. Run `python -m nbamodel train` to add them.")
+    lines_today = _today_lines(day)
     rows = []
     for g in today.itertuples():
         pair = features.matchup_rows(games, players, impact, day, season, g.HOME_TEAM_ID, g.AWAY_TEAM_ID,
@@ -537,6 +567,11 @@ def predict_date(day: pd.Timestamp, use_injury_report: bool = True, refresh: boo
                                      roster.get(g.HOME_TEAM_ID) or None, roster.get(g.AWAY_TEAM_ID) or None)
         X = pd.DataFrame(pair)
         home_pts, away_pts = model.predict(fitted, X)
+        line = lines_today.get((g.HOME_TEAM, g.AWAY_TEAM), {})
+        game = pd.DataFrame([{"PRED_MARGIN": home_pts - away_pts, "PRED_TOTAL": home_pts + away_pts,
+                              "EARLY": max(r["SEASON_GAMES"] for r in pair) < config.EARLY_SEASON_GAMES,
+                              "VEGAS_HOME_MARGIN": line.get("VEGAS_HOME_MARGIN", float("nan")),
+                              "VEGAS_TOTAL": line.get("VEGAS_TOTAL", float("nan"))}])
         if details is not None:
             for row, team, opp, pts in ((pair[0], g.HOME_TEAM, g.AWAY_TEAM, home_pts),
                                         (pair[1], g.AWAY_TEAM, g.HOME_TEAM, away_pts)):
@@ -553,14 +588,49 @@ def predict_date(day: pd.Timestamp, use_injury_report: bool = True, refresh: boo
             "home_pts": round(home_pts, 1),
             "home_margin": round(home_pts - away_pts, 1),
             "total": round(home_pts + away_pts, 1),
+            **_chances(chances, game),
             "home_lineup_pts": round(pair[0]["LINEUP_OFF_PTS"] - pair[1]["LINEUP_DEF_PTS"], 1),
             "away_lineup_pts": round(pair[1]["LINEUP_OFF_PTS"] - pair[0]["LINEUP_DEF_PTS"], 1),
             "home_missing": pair[0]["MISSING"],
             "away_missing": pair[1]["MISSING"],
             "injury_report": source,
+            "vegas_book": line.get("BOOK"),
             "tip_off": g.GAME_TIME_UTC,
         })
     return pd.DataFrame(rows)
+
+
+def _today_lines(day: pd.Timestamp) -> dict:
+    """(home, away) -> that game's current spread and total from ESPN. Empty if ESPN can't be
+    reached: the predictions still run, without lines."""
+    try:
+        lines_ = vegas.today(day)
+    except Exception as e:
+        print(f"Could not load today's lines from ESPN ({e}); predicting without them.")
+        return {}
+    return {(r["HOME"], r["AWAY"]): r for r in lines_.dropna(subset=["VEGAS_HOME_MARGIN"]).to_dict("records")}
+
+
+# Columns for odds against today's line, shown only when decision 13's test turned them on.
+ODDS_COLUMNS = {"cover": "home_cover_prob", "over": "over_prob"}
+
+
+def _chances(chances: dict | None, game: pd.DataFrame) -> dict:
+    """Home win probability, today's line and the model's gap to it, and odds against the line where
+    decision 13 found a method that beats a coin flip. Missing lines leave blanks."""
+    g = game.iloc[0]
+    out = {}
+    if chances:
+        p = probability.win_probability(chances["win_method"], chances["win"], game)[0]
+        out["home_win_prob"] = round(float(p), 3)
+    out.update({"vegas_margin": g["VEGAS_HOME_MARGIN"], "vegas_total": g["VEGAS_TOTAL"],
+                "margin_vs_vegas": round(g["PRED_MARGIN"] - g["VEGAS_HOME_MARGIN"], 1),
+                "total_vs_vegas": round(g["PRED_TOTAL"] - g["VEGAS_TOTAL"], 1)})
+    for bet, column in ODDS_COLUMNS.items():
+        if chances and bet in chances:
+            p = probability.line_probability(chances[bet]["method"], chances[bet], bet, game)[0]
+            out[column] = round(float(p), 3)
+    return out
 
 
 def _game_id(game_id) -> str:
@@ -651,7 +721,9 @@ def cmd_predict(args, refresh: bool = False, now: pd.Timestamp | None = None):
     except PermissionError:
         print(f"Could not save {path}: it is probably open in Excel. Close it and run again.")
         return
-    print(preds[["away", "home", "away_pts", "home_pts", "home_margin", "total"]].to_string(index=False))
+    shown = ["away", "home", "away_pts", "home_pts", "home_margin", "total", "home_win_prob", "vegas_margin",
+             "vegas_total", *ODDS_COLUMNS.values()]
+    print(preds[[c for c in shown if c in preds]].to_string(index=False))
     print(f"Saved {path}. For a game's breakdown: python -m nbamodel explain --date {day.date()} --game <team>")
     if getattr(args, "push", False):
         push_predictions(str(day.date()))
@@ -726,6 +798,8 @@ def main(argv=None):
                         help="Test decision 12's changes to team ratings instead (results/ratings_tuning.md)")
     sub.add_parser("compare", help="Other kinds of model against ridge regression (decision 11), "
                    "written to results/comparison.md")
+    sub.add_parser("probability", help="Win probability, score ranges and cover and over/under odds "
+                   "(decision 13), written to results/probability.md")
     sub.add_parser("report", help="Redraw the charts in docs/figures from results/ and data/model.json")
     p_explain = sub.add_parser("explain", help="Chart of how one game's prediction is built")
     p_explain.add_argument("--game", required=True, help="Either team's abbreviation, e.g. BOS")
@@ -757,6 +831,8 @@ def main(argv=None):
         cmd_tune(args)
     elif args.command == "compare":
         cmd_compare(args)
+    elif args.command == "probability":
+        cmd_probability(args)
     elif args.command == "injuries":
         cmd_injuries(args)
     elif args.command == "report":

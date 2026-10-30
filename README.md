@@ -15,6 +15,8 @@ Validation seasons 2023-24 and 2024-25, 2,620 games. Each month is predicted by 
 
 ![Model vs Vegas by month](docs/figures/vegas_by_month.png)
 
+Each prediction also comes with a win probability, from how far the model's predictions missed in earlier months. When it gives the home team 70%, the home team wins about 70% of the time ([decision 13](docs/decisions.md#13-how-sure-is-each-prediction)).
+
 The 2025-26 season is held back as a locked test set; see [How it's evaluated](#how-its-evaluated).
 
 ## How a prediction is built
@@ -94,7 +96,11 @@ Each run also pulls every team's current roster. Players who have left a team ar
 
 ![Kinds of model against ridge regression](docs/figures/model_comparison.png)
 
-Full tables are in [results/evaluation.md](results/evaluation.md) and [results/comparison.md](results/comparison.md). `python -m nbamodel backtest` gives a simpler season-by-season check in [results/backtest.md](results/backtest.md). In both, lineups use who actually played (historical injury reports are not kept) and player values use only the previous season's BPM, to avoid looking ahead.
+`python -m nbamodel probability` checks the win probabilities the same way, scoring each month with chances learned only from earlier months' misses:
+
+![Calibration of win probabilities](docs/figures/calibration.png)
+
+Full tables are in [results/evaluation.md](results/evaluation.md), [results/comparison.md](results/comparison.md) and [results/probability.md](results/probability.md). `python -m nbamodel backtest` gives a simpler season-by-season check in [results/backtest.md](results/backtest.md). In all of them, lineups use who actually played (historical injury reports are not kept) and player values use only the previous season's BPM, to avoid looking ahead.
 
 ## Key decisions
 
@@ -109,6 +115,7 @@ Each is explained with its evidence in the [decision log](docs/decisions.md):
 - [Hand-picked settings tuned](docs/decisions.md#10-hand-picked-settings): 3 of 8 changed after a test fixed in advance, with longer memory for team ratings and player minutes
 - [Ridge regression kept over seven other kinds of model](docs/decisions.md#11-kinds-of-model): a neural network, gradient boosting, random forest and others fit past games better but predicted new months worse
 - [Better team ratings](docs/decisions.md#12-better-team-ratings): change detection (CUSUM) added after a test fixed in advance; a season-start prior and a trend were tested and left out
+- [Win probability from a normal spread](docs/decisions.md#13-how-sure-is-each-prediction): logistic and isotonic calibration tied it; odds against the betting line did no better than a coin flip, so they aren't shown
 
 ## Data
 
@@ -142,6 +149,7 @@ python -m nbamodel evaluate --compare all   # adds a with/without table for each
 python -m nbamodel tune          # tests the hand-picked settings one by one (results/tuning.md)
 python -m nbamodel compare       # other kinds of model against ridge regression (results/comparison.md)
 python -m nbamodel tune --ratings # tests changes to how team ratings are built (results/ratings_tuning.md)
+python -m nbamodel probability   # win probability, score ranges, cover and over/under odds (results/probability.md)
 python -m nbamodel report        # redraw the charts in docs/figures
 python -m nbamodel predict       # today's games
 python -m nbamodel explain --game BOS   # chart of how one game's prediction is built
@@ -182,9 +190,15 @@ When a later run changes a prediction by a point or more, the change and the pla
 | --- | --- |
 | `away_pts`, `home_pts` | Predicted final score |
 | `home_margin`, `total` | Home points minus away points, and combined points |
+| `home_win_prob` | Chance the home team wins, from how far the model's past predictions missed ([decision 13](docs/decisions.md#13-how-sure-is-each-prediction)) |
+| `vegas_margin`, `vegas_total` | Today's betting line from ESPN at the time of the run: the expected home margin (5.5 = home favored by 5.5) and total |
+| `margin_vs_vegas`, `total_vs_vegas` | The model's margin and total minus the line's |
 | `home_lineup_pts`, `away_lineup_pts` | How much tonight's lineups moved that team's margin |
 | `home_missing`, `away_missing` | Rotation players with less than a 100% chance of playing |
+| `vegas_book` | The sportsbook the line came from |
 | `tip_off`, `predicted_at` | Scheduled tip-off and when the prediction was made, both in UTC |
+
+Odds that the home team covers the spread (`home_cover_prob`) or that the game goes over the total (`over_prob`) are added only if decision 13's test finds a way to give them that beats a coin flip.
 
 `predictions/<date>_details.csv` has one row per team with every input and the points each step adds, which is what `explain` draws.
 

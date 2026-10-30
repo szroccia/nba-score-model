@@ -1,4 +1,5 @@
-"""Historical closing Vegas lines from ESPN, used as the benchmark the model has to beat.
+"""Vegas lines from ESPN: past closing lines, the benchmark the model has to beat, and today's
+lines for the daily predictions.
 
 ESPN's public API keeps each game's pregame spread and over/under from several
 sportsbooks. The scoreboard gives the day's games; a second call per game gives
@@ -22,6 +23,9 @@ ODDS_URL = ("https://sports.core.api.espn.com/v2/sports/basketball/leagues/nba/"
 PROVIDER_ORDER = ["consensus", "ESPN BET", "DraftKings", "Caesars Sportsbook", "MGM"]
 # ESPN abbreviations that differ from nba.com's.
 ESPN_TO_NBA = {"GS": "GSW", "NY": "NYK", "NO": "NOP", "SA": "SAS", "UTAH": "UTA", "WSH": "WAS"}
+# One row per game, as saved in data/vegas_<season>.csv.
+LINE_COLUMNS = ["EVENT_ID", "GAME_DATE", "HOME_ESPN", "AWAY_ESPN", "HOME_PTS", "AWAY_PTS",
+                "VEGAS_HOME_MARGIN", "VEGAS_TOTAL", "BOOK"]
 
 
 def _get_json(url: str, tries: int = 3) -> dict:
@@ -102,12 +106,20 @@ def fetch_season(season: str, workers: int = 8) -> pd.DataFrame:
     with ThreadPoolExecutor(workers) as pool:
         games = [g for day_games in pool.map(_day_games, days) for g in day_games]
         rows = list(pool.map(_with_line, games))
-    df = pd.DataFrame(rows, columns=["EVENT_ID", "GAME_DATE", "HOME_ESPN", "AWAY_ESPN", "HOME_PTS",
-                                     "AWAY_PTS", "VEGAS_HOME_MARGIN", "VEGAS_TOTAL", "BOOK"])
+    df = pd.DataFrame(rows, columns=LINE_COLUMNS)
     df["HOME"] = df["HOME_ESPN"].map(nba_abbreviation)
     df["AWAY"] = df["AWAY_ESPN"].map(nba_abbreviation)
     df["SEASON"] = season
     return df
+
+
+def today(day: pd.Timestamp) -> pd.DataFrame:
+    """Each game's current pregame spread and total on a day. Before tip-off this is the line at
+    the time of the run, which can still move before it closes."""
+    df = pd.DataFrame([_with_line(g) for g in _day_games(day)], columns=LINE_COLUMNS)
+    df["HOME"] = df["HOME_ESPN"].map(nba_abbreviation)
+    df["AWAY"] = df["AWAY_ESPN"].map(nba_abbreviation)
+    return df[["HOME", "AWAY", "VEGAS_HOME_MARGIN", "VEGAS_TOTAL", "BOOK"]]
 
 
 def lines(season: str, refresh: bool = False) -> pd.DataFrame:

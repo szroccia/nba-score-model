@@ -18,6 +18,7 @@ The major modeling choices, what was considered, the evidence and the reason for
 | 10 | [Hand-picked settings](#10-hand-picked-settings) | Rating half-life 24, minutes half-life 12, replacement level -3; five others kept | Beat the noise on margin error; total error rose 0.11 |
 | 11 | [Kinds of model](#11-kinds-of-model) | Ridge regression stays | Five flexible models were worse on margin error beyond the noise; elastic net and a blend tied |
 | 12 | [Better team ratings](#12-better-team-ratings) | Change detection (CUSUM) at 80; season-start prior and trend left out | CUSUM beat the noise on total error, with margin a tie; the others tied or were worse |
+| 13 | [How sure is each prediction](#13-how-sure-is-each-prediction) | Normal spread for win probability; no cover or over/under odds | The calibration methods tied; odds against the line did no better than a coin flip |
 
 ---
 
@@ -351,3 +352,69 @@ Elastic net, k-nearest neighbors, support vector regression and the neural netwo
 - **Luck.** With 8 comparisons, there's about a 1 in 3 chance of one lucky pass (point 6), and this pass is narrow. The locked test season has the last word.
 
 ![Changes to team ratings](figures/ratings_tuning.png)
+
+---
+
+## 13. How sure is each prediction
+
+**Question.** The model predicts each team's points, so it says who should win and by how much, but not how likely that is. A 3-point favorite loses far more often than a 12-point favorite. How should a predicted margin become a win probability? And can the model give honest odds against a betting line?
+
+**Where the spread comes from.** The model's own misses. Every month from November 2022 on is predicted by a model fit only on earlier games, exactly as in the evaluation (decision 5), and how far those predictions missed is the record. Each validation month's probabilities are fit only on the record before that month, so the 2,621 validation games stay unseen. October 2023, the first validation month, learns from 2022-23 from November on.
+
+| # | Method | What it does | Numbers it learns |
+| --- | --- | --- | --- |
+| 1 | Normal spread (in use) | Real margins land around the predicted margin in a bell curve as wide as the typical past miss (the root mean square). The win chance is the share of the curve above zero | 1 |
+| 2 | Early-season spread | The same, with its own width for games where neither team has played 15 games yet, when ratings still lean on last season | 2 |
+| 3 | Logistic calibration (Platt scaling) | A logistic regression of past wins on the predicted margin. It fits wins directly, so a few blowouts can't widen it, and its intercept can correct a lean toward home or away teams | 2 |
+| 4 | Isotonic calibration | A step curve fit to past wins, with one rule: a bigger predicted margin never means a lower chance. It can bend where a bell curve can't, and it can also overfit | one per step |
+
+**Why they might help, and why they might not.** Blowouts make the typical miss bigger than the misses that decide close games, so the normal spread may be too cautious; methods 3 and 4 fit wins directly and avoid that. Early-season predictions miss by more (decision 12's slices), so one width for the whole season may be too sure in October. But the normal spread is one number learned from thousands of games, and every extra number has to earn its keep.
+
+**Settings fixed with the methods,** not tested: no probability below 1% or above 99%, so one upset can't cost an unbounded log loss; the logistic regressions are effectively unpenalized; early season means neither team has played 15 games, as in decision 12.
+
+**Test fixed in advance,** written down before any results existed (October 30, 2026). `python -m nbamodel probability` runs it and writes [results/probability.md](../results/probability.md):
+
+1. Score each method's win probabilities on the validation games by log loss: minus the log of the chance it gave to what happened, averaged over games. Log loss punishes a confident miss hardest, so it rewards probabilities that are sharp and honest at once. A coin flip scores 0.693.
+2. Compare each method with the normal spread on the same games, with the noise test from decisions 8 to 12: the average change in log loss must exceed 2 standard errors, measured month to month.
+3. A method replaces the normal spread only if it is better beyond the noise. If several are, the lowest log loss wins. Ties keep the normal spread, the simplest.
+4. Reported, never deciding: the Brier score (the average squared miss of the probability); a calibration chart (for each tenth of predicted chance, how often the home team won); a coin flip and the home team at its usual win rate as baselines; and Vegas's closing spread turned into a win probability the same way as the normal spread, with the width of its own misses in earlier months.
+5. Score ranges, also reported: the middle 80% of outcomes under the normal spread (the prediction plus or minus 1.28 typical misses), for margin and total, and the share of games that landed inside. If the spread is right, that share is about 80%.
+6. **Cover and over/under odds.** On validation games with an ESPN closing line, leaving out games that landed exactly on it (pushes), three ways to give the chance the home team covers, and the same three for the chance the game goes over:
+
+| Method | What it does |
+| --- | --- |
+| Coin flip | 50% every game. The baseline: a closing line is set so that each side wins about half the time |
+| Normal spread around the model | The model's number as the center and its typical miss as the width; the chance is the share of that curve beyond the line. It treats the model as right about the center, though Vegas misses by less |
+| Calibrated to the gap | A logistic regression, on earlier games with a line, of whether the home team covered (or the game went over) on how far the model was from the line. No intercept, so agreeing with the line means 50%. It learns how much the model's disagreements have meant; if they mean nothing, it says about 50% |
+
+7. Each odds method is compared with a coin flip by log loss with the same noise test. **Choice fixed in advance (Steve, October 30, 2026):** daily predictions always show today's spread and total from ESPN and the model's gap to them. Cover or over/under odds appear only from a method that beats a coin flip beyond the noise, the lower log loss if both do. Also reported: how often the model's side of the line won, against the 52.4% that breaks even at standard odds (risk 110 to win 100).
+8. Closing lines for 2022-23 are downloaded too, so the calibrated odds and Vegas's width have a season of history before October 2023.
+9. **Luck.** Each comparison has about a 1 in 20 chance of passing by luck alone. Across the 3 win probability comparisons, there's about a 1 in 7 chance that one does; across the 4 odds comparisons, about 1 in 5. The locked test season, scored once at the end, has the last word.
+
+**What this test can't check.**
+- Validation predictions know who actually played (decision 5). Daily predictions face injury uncertainty, so live misses run somewhat larger and live probabilities may be a little too sure. The saved daily predictions will show by how much once a season of them builds up.
+- Daily runs see the line at 11 AM or 6 PM, and it can still move before tip-off; the test uses closing lines.
+- These are probabilities for single games. Season and playoff odds come next, from simulating seasons game by game with them.
+
+**In daily predictions.** `train` fits the method in use on the whole record (2022-23 to 2024-25, never the test season) and saves it in `data/model.json`; `predict` adds the home team's win probability, today's line and the model's gap to it. If the test picks another method, or odds that beat a coin flip, turning them on is a separate step after the result.
+
+**Result (October 30, 2026).** Full tables are in [results/probability.md](../results/probability.md). Nothing beat the methods in use, so nothing changes:
+
+| Method | Log loss | Brier score | Log loss change | Noise | Verdict |
+| --- | --- | --- | --- | --- | --- |
+| Normal spread (in use) | 0.5988 | 0.2064 | - | - | current |
+| Early-season spread | 0.5990 | 0.2065 | +0.0001 | 0.0002 | tie |
+| Logistic calibration | 0.5981 | 0.2062 | -0.0008 | 0.0027 | tie |
+| Isotonic calibration | 0.6041 | 0.2071 | +0.0052 | 0.0107 | tie |
+
+- **The normal spread stays.** Logistic calibration was a hair better on average but well inside the noise. Isotonic calibration was worse on average and the noisiest, the overfitting risk named above. A separate early-season width made no difference.
+- **The probabilities are honest.** Grouped in tenths, the predicted chance sits 1.9 points from how often the home team actually won, on average. One tenth stands out: when the model gave the home team 20 to 30% (193 games, 25.4% on average), it won 16.1% of the time. Logistic calibration, which could bend for that, still tied overall.
+- **Against Vegas.** Log loss 0.599 for the model against 0.584 for Vegas's spread on the same 2,620 games, with a coin flip at 0.693 and the home team at its usual win rate at 0.690. The model covers about 87% of the way from a coin flip to Vegas.
+- **Score ranges fit.** The typical miss is 13.6 points on the margin and 18.5 on the total. Of the validation games, 78.7% landed inside the 80% range for the margin (plus or minus 17.5 points) and 81.0% inside it for the total (plus or minus 23.8). A bell curve describes the misses well.
+- **Cover and over/under: no method beats a coin flip.** The normal spread around the model was worse than a coin flip beyond the noise, on the spread (+0.0115 against noise 0.0106) and the total (+0.0185 against 0.0091): treating the model as right about the center makes it too sure, because the line is the sharper number. Calibrated to the gap tied a coin flip (+0.0001 and +0.0003): having learned from earlier games how little the disagreements meant, it says close to 50% every game. The model's side of the line won 51.8% of the time on the spread and 48.7% on the total, both short of the 52.4% that breaks even. The closing line already knows what the model knows.
+
+**What daily predictions show,** as fixed in advance: the home team's win probability from the normal spread (typical miss 13.6 points, from 3,833 games of 2022-23 to 2024-25), today's spread and total, and the model's gap to them. No cover or over/under odds.
+
+![Calibration of win probabilities](figures/calibration.png)
+
+![Probability tests](figures/probability_tests.png)

@@ -81,6 +81,22 @@ FOUR_FACTORS = False
 # Rest days are capped: 3+ days off is treated the same as 3.
 MAX_REST_DAYS = 3
 
+# Early season: games where neither team has played this many games yet. Reported as a slice in
+# backtests and tuning; decision 13's early-season spread gives these games their own width.
+EARLY_SEASON_GAMES = 15
+
+# Decision 13: how a predicted margin becomes a win probability, learned from the model's own
+# misses in earlier months. "normal" (misses spread like a bell curve, as wide as the typical
+# miss) is in use unless the test picks "early", "logistic" or "isotonic" (docs/decisions.md).
+WIN_PROBABILITY = "normal"
+# No probability goes below this or above 1 minus it, so one surprise can't cost an unbounded log loss.
+PROBABILITY_FLOOR = 0.01
+# Daily predictions show today's spread and total from ESPN and the model's gap to them. Odds
+# that the home team covers, or that the game goes over, are shown only from a method that beat
+# a coin flip in decision 13's test (Steve, October 30, 2026): "normal" or "calibrated". None = not shown.
+COVER_ODDS = None
+OVER_UNDER_ODDS = None
+
 # Ridge regression strength. Every alpha from 0.01 to 100 scored the same on validation
 # (results/evaluation.md); the selection rule breaks ties toward the simpler model, which is 10.
 RIDGE_ALPHA = 10.0

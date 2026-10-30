@@ -94,8 +94,14 @@ def paired_change(base: pd.DataFrame, other: pd.DataFrame, target: str) -> tuple
     both = base.merge(other, on="GAME_ID", suffixes=("_base", "_other"))
     change = ((both[f"{target}_other"] - both[f"PRED_{target}_other"]).abs()
               - (both[f"{target}_base"] - both[f"PRED_{target}_base"]).abs())
+    return clustered_mean(change, both["FOLD_base"])
+
+
+def clustered_mean(change, months) -> tuple[float, float]:
+    """Average of per-game changes, and its standard error with each month as one block."""
+    change = pd.Series(np.asarray(change, float))
     mean = float(change.mean())
-    blocks = change.groupby(both["FOLD_base"]).agg(["sum", "size"])
+    blocks = change.groupby(np.asarray(months)).agg(["sum", "size"])
     resid = blocks["sum"] - blocks["size"] * mean
     k = len(blocks)
     se = float(np.sqrt(k / (k - 1) * (resid ** 2).sum()) / len(change)) if k > 1 else float("inf")
@@ -284,7 +290,7 @@ def write_report(out_dir, seasons, current: dict, vegas_table, curve, learn, ext
             "train_margin_mae": ("Margin MAE, training", _f2), "games": ("Validation games", _int)})
     if extra:
         lines += ["", *extra]
-    (out_dir / "evaluation.md").write_text("\n".join(lines) + "\n")
+    (out_dir / "evaluation.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return lines
 
 

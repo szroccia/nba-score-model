@@ -55,7 +55,7 @@ def read_tables(path) -> dict[str, pd.DataFrame]:
             tables[heading] = pd.DataFrame(body, columns=header)
         rows.clear()
 
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         if line.startswith("#"):
             flush()
             heading = line.lstrip("#").strip()
@@ -71,7 +71,7 @@ def read_backtest(path=None) -> pd.DataFrame:
     """Parse the markdown table that `backtest` writes."""
     path = path or config.ROOT / "results" / "backtest.md"
     rows = []
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
         if len(cells) in (7, 8) and re.match(r"\d{4}-\d{2}", cells[0]):
             rows.append({
@@ -467,6 +467,104 @@ def model_fit(table: pd.DataFrame, out):
     return _save(fig, out)
 
 
+# Calibration tenths with fewer games than this are left off the chart's lines.
+MIN_GAMES = 20
+
+
+def calibration(tables: dict, out):
+    """Decision 13: when the model gave the home team a 70% chance, did it win about 70% of the time?
+    Each tenth of predicted chance against how often the home team won, for the model and Vegas,
+    with how many games fell in each tenth below. Tenths with few games swing by luck, so those
+    with fewer than MIN_GAMES are left off the lines."""
+    plt = _plt()
+    bins = tables["Calibration"]
+    fig, (ax, counts) = plt.subplots(2, 1, figsize=(7.5, 6.6), facecolor=SURFACE, sharex=True,
+                                     gridspec_kw={"height_ratios": [3.2, 1], "hspace": 0.12})
+    _style(ax, "", grid_axis="both")
+    ax.plot([0, 100], [0, 100], color=MUTED, linewidth=1, linestyle=(0, (4, 3)), label="Perfect calibration")
+    for who, color in (("model", BLUE), ("Vegas", ORANGE)):
+        shown = bins[pd.to_numeric(bins[f"{who.capitalize()} games"], errors="coerce").fillna(0) >= MIN_GAMES]
+        if not shown.empty:
+            _line(ax, shown[f"{who.capitalize()} said"].astype(float), shown[f"Home won, {who}"].astype(float), color,
+                  "Model" if who == "model" else "Vegas spread")
+    ax.set_xlim(0, 100)
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("Home team won, %", fontsize=9, color=MUTED)
+    _legend(ax, loc="upper left")
+    _style(counts, "", grid_axis="y")
+    centers = [10 * b + 5 for b in range(len(bins))]
+    counts.bar(centers, bins["Model games"].astype(float), width=8, color=BLUE)
+    counts.set_ylabel("Model's games", fontsize=9, color=MUTED)
+    counts.set_xlabel("Predicted chance the home team wins, %", fontsize=9, color=MUTED)
+    counts.set_xticks(range(0, 101, 10))
+    # The headline names how far the model's tenths sit from the line, weighted by games.
+    games = bins["Model games"].astype(float)
+    shown = games > 0
+    said = bins.loc[shown, "Model said"].astype(float)
+    gap = float((games[shown] * (said - bins.loc[shown, "Home won, model"].astype(float)).abs()).sum() / games.sum())
+    loss = tables["Win probability"].set_index("Verdict").loc["current"]
+    _headline(fig, "How often the home team won, at each predicted chance",
+              f"{int(games.sum()):,} validation games; each month's chances come only from earlier months' misses. "
+              f"On the dashed line, a 70% call wins 70% of the time. The model's tenths sit {gap:.1f} points off it "
+              f"on average. Log loss: model {float(loss['Log loss']):.3f}, coin flip 0.693. Tenths with fewer "
+              f"than {MIN_GAMES} games are left off the lines.")
+    fig.subplots_adjust(left=0.11, right=0.96, top=0.8, bottom=0.09)
+    return _save(fig, out)
+
+
+def _change_rows(ax, items, reach, title):
+    """One row per (label, change, noise, verdict): a dot for the change in log loss, a gray bar for
+    the noise, and the numbers in one column to the right."""
+    from matplotlib.ticker import MaxNLocator
+
+    _style(ax, title, grid_axis="x")
+    y = list(range(len(items)))[::-1]
+    for yi, (_, change, noise, verdict) in zip(y, items):
+        ax.plot([change - noise, change + noise], [yi, yi], color=GRAY, linewidth=6, solid_capstyle="butt")
+        ax.scatter([change], [yi], s=90, color=ORANGE if verdict == "better" else BLUE, edgecolor=SURFACE,
+                   linewidth=2, zorder=3)
+        ax.annotate(f"{change:+.4f} ± {noise:.4f}  {verdict}", (reach * 1.12, yi), va="center", fontsize=9,
+                    color=INK)
+    ax.axvline(0, color=MUTED, linewidth=1)
+    ax.set_xlim(-reach * 1.1, reach * 2.6)
+    ax.xaxis.set_major_locator(MaxNLocator(5))
+    ax.set_ylim(-0.6, len(items) - 0.4)
+    ax.set_yticks(y, [label for label, _, _, _ in items])
+    ax.tick_params(axis="y", labelcolor=INK)
+    ax.set_xlabel("Change in log loss per game (below zero is better)", fontsize=9, color=MUTED)
+
+
+def probability_tests(tables: dict, out):
+    """Decision 13: each way of giving a win probability against the one in use, and each way of
+    giving cover and over/under odds against a coin flip, with the noise."""
+    plt = _plt()
+    win = tables["Win probability"]
+    current = win.loc[win["Verdict"] == "current", "Method"].iloc[0]
+    win_items = [(r["Method"], float(r["Log loss change"]), float(r["Noise"]), r["Verdict"])
+                 for _, r in win[win["Verdict"] != "current"].iterrows()]
+    panels = [(f"Win probability, against the {current.lower()}", win_items)]
+    bets = tables.get("Cover and over/under odds")
+    if bets is not None:
+        bet_items = [(r["Bet"].replace(": ", ":\n"), float(r["Log loss change"]), float(r["Noise"]), r["Verdict"])
+                     for _, r in bets[bets["Verdict"] != "baseline"].iterrows()]
+        panels.append(("Cover and over/under, against a coin flip", bet_items))
+    fig, axes = plt.subplots(1, len(panels), figsize=(6.2 * len(panels), 4.4), facecolor=SURFACE, squeeze=False)
+    for ax, (title, items) in zip(axes[0], panels):
+        reach = max(max(abs(c) + n for _, c, n, _ in items), 0.001)
+        _change_rows(ax, items, reach, title)
+    better = win.loc[win["Verdict"] == "better", "Method"]
+    title = f"{better.iloc[0]} beats the {current.lower()}" if len(better) else f"The {current.lower()} holds up"
+    if bets is not None:
+        winners = bets.loc[bets["Verdict"] == "better", "Bet"]
+        title += (", and some odds beat a coin flip" if len(winners) else ", and no odds beat a coin flip")
+    _headline(fig, title,
+              "Average change in log loss on the same validation games, each month fit only on earlier months. "
+              "Gray bars are the noise (2 standard errors, month to month): a bar crossing zero is a tie, which "
+              "keeps the simpler choice. Orange beats the noise.")
+    fig.subplots_adjust(left=0.2 if len(panels) == 1 else 0.13, right=0.97, top=0.72, bottom=0.14, wspace=0.9)
+    return _save(fig, out)
+
+
 def cv_scheme(out):
     """How evaluation splits time: rolling monthly folds on validation seasons, test season locked."""
     plt = _plt()
@@ -575,6 +673,10 @@ def run(fig_dir=None) -> list:
         tables = read_tables(results / "comparison.md")
         made.append(model_comparison(tables["Against ridge regression"], fig_dir / "model_comparison.png"))
         made.append(model_fit(tables["Training and validation error"], fig_dir / "model_fit.png"))
+    if (results / "probability.md").exists():
+        tables = read_tables(results / "probability.md")
+        made.append(calibration(tables, fig_dir / "calibration.png"))
+        made.append(probability_tests(tables, fig_dir / "probability_tests.png"))
     if (results / "evaluation.md").exists():
         tables = read_tables(results / "evaluation.md")
         if "Against the Vegas closing line" in tables:

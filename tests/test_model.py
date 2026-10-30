@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import pytest
+from scipy.stats import norm
 
 from nbamodel import features, injuries, lineup, model, ratings
 from nbamodel.names import normalize_name
@@ -168,7 +169,11 @@ def test_predict_date_with_fake_data(monkeypatch, tmp_path):
     monkeypatch.setattr(data, "rosters", lambda s, refresh=False: roster.assign(PLAYER=""))
     games = ratings.team_game_table(team_games)
     feats = features.historical_features(games, player_games, {"2024-25": pd.DataFrame(columns=["OBPM", "DBPM"])}, ["2024-25"])
-    monkeypatch.setattr(model, "load", lambda: model.fit(feats))
+    fitted = model.fit(feats) | {"probability": {"win_method": "normal", "win": {"sd": 13.0}}}
+    monkeypatch.setattr(model, "load", lambda: fitted)
+    monkeypatch.setattr(cli.vegas, "today", lambda day: pd.DataFrame({
+        "HOME": ["T1", "T2"], "AWAY": ["T4", "T3"], "VEGAS_HOME_MARGIN": [-2.5, 1.0], "VEGAS_TOTAL": [221.5, 230.0],
+        "BOOK": ["consensus", "consensus"]}))
 
     preds = cli.predict_date(day, use_injury_report=False)
     assert len(preds) == 1
@@ -177,6 +182,21 @@ def test_predict_date_with_fake_data(monkeypatch, tmp_path):
     assert "Player BA" in row["home_missing"]
     assert row["home_lineup_pts"] < 0
     assert row["game_id"] == "0000000999" and row["tip_off"] == "2025-01-16T00:30:00Z"
+    # Win probability from the saved spread, and today's line with the model's gap to it.
+    assert row["home_win_prob"] == pytest.approx(norm.cdf((row["home_pts"] - row["away_pts"]) / 13.0), abs=0.002)
+    assert row["vegas_margin"] == -2.5 and row["vegas_total"] == 221.5 and row["vegas_book"] == "consensus"
+    assert row["margin_vs_vegas"] == pytest.approx(row["home_margin"] + 2.5, abs=0.11)
+    assert "home_cover_prob" not in preds and "over_prob" not in preds  # off until a method beats a coin flip
+
+    # With cover odds on, they appear; if ESPN can't be reached, the predictions still run without lines.
+    fitted["probability"]["cover"] = {"method": "calibrated", "slope": 0.05}
+
+    def unreachable(day):
+        raise OSError("no network")
+
+    monkeypatch.setattr(cli.vegas, "today", unreachable)
+    row = cli.predict_date(day, use_injury_report=False).iloc[0]
+    assert pd.isna(row["vegas_margin"]) and pd.isna(row["home_cover_prob"]) and 0 < row["home_win_prob"] < 1
 
 
 def test_roster_moves_count_departures_and_newcomers():
@@ -1054,3 +1074,121 @@ def test_tune_ratings_reports_slices_and_restores_config(monkeypatch, tmp_path):
     assert (0.4, 0.0, None) in seen and (1.0, 0.0, 80) in seen      # every value was built
     assert (config.SEASON_CARRYOVER, config.RATING_TREND, config.CUSUM_THRESHOLD) == (1.0, 0.0, None)
     assert (tmp_path / "docs" / "figures" / "ratings_tuning.png").stat().st_size > 10_000
+
+
+def _record(n=6000, sd=12.0, early_sd=18.0, seed=0):
+    """Games like probability.record makes: predicted margins, and results that miss them by a bell
+    curve as wide as sd (early_sd in the first fifth of each month's games, the early season)."""
+    rng = np.random.default_rng(seed)
+    dates = pd.Timestamp("2022-11-01") + pd.to_timedelta(np.sort(rng.uniform(0, 600, n)), unit="D")
+    early = rng.uniform(size=n) < 0.2
+    pred = rng.normal(0, 7, n)
+    margin = np.round(pred + rng.normal(0, 1, n) * np.where(early, early_sd, sd)) + 0.5  # no ties, as in the NBA
+    return pd.DataFrame({"GAME_ID": range(n), "GAME_DATE": dates, "FOLD": dates.to_period("M").astype(str),
+                         "PRED_MARGIN": pred, "MARGIN": margin, "EARLY": early})
+
+
+def test_win_probability_methods_learn_from_past_misses():
+    from nbamodel import probability
+
+    rec = _record()
+    normal = probability.fit_win("normal", rec)
+    assert normal["sd"] == pytest.approx(np.sqrt(0.8 * 12 ** 2 + 0.2 * 18 ** 2), rel=0.05)
+    even = pd.DataFrame({"PRED_MARGIN": [-10.0, 0.0, 10.0, 200.0], "EARLY": [False, False, True, False]})
+    p = probability.win_probability("normal", normal, even)
+    assert p[1] == pytest.approx(0.5) and p[0] == pytest.approx(1 - p[2])
+    assert p[3] == pytest.approx(0.99)  # never surer than the floor allows
+    early = probability.fit_win("early", rec)
+    assert early["sd"] == pytest.approx(12, rel=0.05) and early["sd_early"] == pytest.approx(18, rel=0.08)
+    assert probability.win_probability("early", early, even)[2] < probability.win_probability("normal", normal, even)[2]
+    logistic = probability.fit_win("logistic", rec)
+    assert abs(logistic["intercept"]) < 0.15 and 0.5 < probability.win_probability("logistic", logistic, even)[2] < 0.9
+    iso = probability.fit_win("isotonic", rec)
+    curve = probability.win_probability("isotonic", iso, pd.DataFrame({"PRED_MARGIN": np.linspace(-40, 40, 81)}))
+    assert np.all(np.diff(curve) >= 0) and curve.min() >= 0.01 and curve.max() <= 0.99
+
+
+def test_probabilities_are_fit_only_on_earlier_months():
+    from nbamodel import probability
+
+    rec = _record().assign(LINE=np.nan)
+    rec.loc[rec["GAME_DATE"] >= "2023-06-01", "LINE"] = 0.0  # lines only from June 2023 on
+    scored = rec[rec["GAME_DATE"] >= "2023-05-01"]
+    seen = {}
+
+    def fit(history):
+        return history["GAME_DATE"].max()
+
+    def predict(last_seen, games):
+        seen[games["FOLD"].iloc[0]] = last_seen
+        return np.full(len(games), 0.5)
+
+    p = probability.walk_forward(rec, scored, fit, predict)
+    assert p.notna().all() and set(seen) == set(scored["FOLD"])
+    assert all(last < pd.Period(fold, "M").start_time for fold, last in seen.items())
+    # A month with no earlier lines is left out of anything that needs one.
+    seen.clear()
+    p = probability.walk_forward(rec, scored, fit, predict, needs="LINE")
+    assert "2023-05" not in seen and "2023-06" not in seen and "2023-07" in seen
+    assert p[scored["FOLD"] == "2023-05"].isna().all()
+
+
+def _lines_for(feats, noise, seed=5):
+    """Closing lines at each game's true expected margin and total, plus noise: with noise, the
+    model's own number knows something the line doesn't."""
+    rng = np.random.default_rng(seed)
+    home = feats[feats["IS_HOME"] == 1].set_index("GAME_ID")
+    away = feats[feats["IS_HOME"] == 0].set_index("GAME_ID").loc[home.index]
+    return pd.DataFrame({
+        "GAME_DATE": home["GAME_DATE"].to_numpy(), "HOME": home["TEAM_ID"].map(lambda t: f"T{t}").to_numpy(),
+        "AWAY": away["TEAM_ID"].map(lambda t: f"T{t}").to_numpy(),
+        "VEGAS_HOME_MARGIN": np.round(2 * (home["BASE_PTS"] - away["BASE_PTS"] + 3 + rng.normal(0, noise, len(home)))) / 2,
+        "VEGAS_TOTAL": np.round(2 * (home["BASE_PTS"] + away["BASE_PTS"] + rng.normal(0, noise, len(home)))) / 2})
+
+
+@pytest.mark.parametrize("noise", [0, 6])
+def test_probability_command_checks_odds_against_a_coin_flip(monkeypatch, tmp_path, noise):
+    from nbamodel import cli, config, report
+
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "VALIDATION_SEASONS", ["2023-24", "2024-25"])
+    monkeypatch.setattr(config, "TEST_SEASON", "2025-26")
+    feats = _fake_features()
+    monkeypatch.setattr(cli, "_historical", lambda seasons: feats[feats["SEASON"].isin(seasons)])
+    monkeypatch.setattr(cli, "_vegas_lines", lambda seasons=None: _lines_for(feats, noise))
+    monkeypatch.setattr(cli.vegas, "team_abbreviations", lambda: {t: f"T{t}" for t in range(1, 7)})
+    cli.main(["probability"])
+    text = (tmp_path / "results" / "probability.md").read_text()
+    assert "Every month from November 2022 on" in text
+    tables = report.read_tables(tmp_path / "results" / "probability.md")
+    win = tables["Win probability"].set_index("Method")
+    assert win.loc["Normal spread", "Verdict"] == "current" and len(win) == 4
+    assert (win["Log loss"] < 0.693).all()  # the model knows who's better, so everything beats a coin flip
+    bets = tables["Cover and over/under odds"].set_index("Bet")
+    calibrated = bets.loc["Home team covers: Calibrated to the gap", "Verdict"]
+    if noise:  # a noisy line: the model's disagreements with it mean something
+        assert calibrated == "better" and "**Home team covers: calibrated to the gap beats a coin flip.**" in text
+    else:      # the line is the truth: disagreeing with it is noise
+        assert calibrated != "better" and "**Home team covers: no method beats a coin flip.**" in text
+    assert tables["Score ranges"].set_index("Prediction").loc["Margin", "Games inside the range"] == pytest.approx(80, abs=5)
+    for name in ("calibration", "probability_tests"):
+        assert (tmp_path / "docs" / "figures" / f"{name}.png").stat().st_size > 10_000
+
+
+def test_train_saves_win_probability_from_the_record_only(monkeypatch, tmp_path):
+    import json
+
+    from nbamodel import cli, config
+
+    monkeypatch.setattr(config, "MODEL_PATH", tmp_path / "model.json")
+    monkeypatch.setattr(config, "TEST_SEASON", "2025-26")
+    feats = _fake_features()
+    monkeypatch.setattr(cli, "_historical", lambda seasons: feats[feats["SEASON"].isin(seasons)])
+    monkeypatch.setattr(cli.model, "save", lambda fitted: config.MODEL_PATH.write_text(json.dumps(fitted)))
+    cli.main(["train"])
+    saved = json.loads(config.MODEL_PATH.read_text())
+    chances = saved["probability"]
+    assert saved["seasons"][-1] == "2025-26"                         # the regression trains on every season
+    assert chances["seasons"] == ["2022-23", "2023-24", "2024-25"]   # the misses never include the test season
+    assert chances["win_method"] == "normal" and chances["win"]["sd"] == chances["margin_sd"]
+    assert 9 < chances["margin_sd"] < 16 and "cover" not in chances and "over" not in chances
