@@ -16,6 +16,7 @@ The major modeling choices, what was considered, the evidence and the reason for
 | 8 | [Strength of schedule](#8-strength-of-schedule) | Adjust for opponents | Beat the noise on margin error, after a fix for a flaw that biased totals |
 | 9 | [Four factors](#9-four-factors) | Left out | Worse on margin error beyond the noise, though better on totals |
 | 10 | [Hand-picked settings](#10-hand-picked-settings) | Rating half-life 24, minutes half-life 12, replacement level -3; five others kept | Beat the noise on margin error; total error rose 0.11 |
+| 11 | [Kinds of model](#11-kinds-of-model) | Ridge regression stays | Five flexible models were worse on margin error beyond the noise; elastic net and a blend tied |
 
 ---
 
@@ -255,3 +256,52 @@ The other five (last season's games, rating shrinkage, rotation cutoff, BPM shri
 
 ![Tuning the hand-picked settings](figures/tuning.png)
 
+
+---
+
+## 11. Kinds of model
+
+**Question.** Ridge regression adds up the inputs with fixed weights. Would a more flexible kind of model, one that can follow curves and combine inputs, predict better from the same inputs?
+
+**Why ask.** Decision 7 found ridge limited by bias, not by data: its error on the games it learned from (10.43) is not far below its error on new months (10.85), and more history stopped helping after about 2,000 team-games. A model that can bend is the textbook remedy for bias. It can also memorize noise in past games, which is what this test checks.
+
+| Model | How it predicts | Settings tried, simplest first |
+| --- | --- | --- |
+| Ridge regression (in use) | A weighted sum of the inputs | alpha 10, from decision 7 |
+| Elastic net | A weighted sum that can also drop inputs | 6: penalty 0.1, 0.01, 0.001, each with an L1 share of 0.9 and 0.1 |
+| k-nearest neighbors | The average of the most similar past team-games | 4: 400, 200, 100, 50 neighbors |
+| Support vector regression | A smooth curve (RBF kernel) that ignores small misses | 3: C 0.3, 1, 3 |
+| Random forest | The average of 300 decision trees, each grown on a resample of the games | 6: smallest leaf 100, 30, 10 team-games, each with half or all of the inputs per split |
+| Gradient boosting | Small trees added one at a time, each correcting the misses of those before | 6: depth 2, 3, 4, each with 100 and 300 trees (learning rate 0.05) |
+| Neural network | A small multilayer perceptron | 4: one layer of 16 or two of 32 and 16, each with penalty 0.1 and 0.001 |
+| Blend | A weighted average of all seven | weights learned every month |
+
+Elastic net, k-nearest neighbors, support vector regression and the neural network see the inputs and points rescaled to a common scale, which they need; the others don't.
+
+**Test fixed in advance,** written down before any results existed (October 30, 2026). `python -m nbamodel compare` runs it and writes [results/comparison.md](../results/comparison.md):
+
+1. **Same everything but the model.** The 8 inputs in use, the same target (each team's points; margin and total come from the pair), and the same 2,620 validation games and monthly folds as every earlier decision.
+2. **Settings chosen without peeking.** In each month, every model tries its settings on that month's training games: it learns from the older 80% and is scored on the most recent 20%, in the usual order (margin error, then total error, then bias; within 0.01 points, the simpler setting). Its pick is refit on all the training games and predicts the month. The month being predicted never helps choose a setting.
+3. **The blend** learns its weights on the same recent 20%, from each model's predictions with its picked setting. Weights can't go below zero, so they read as shares, such as 60% ridge and 40% boosting.
+4. **Each challenger against ridge** with the noise test from decisions 8 to 10. Margin error decides first, then total error, and a change must exceed 2 standard errors, measured month to month. The bias guard applies: no model that moves the average total more than 0.5 points further from the actual.
+5. **A challenger replaces ridge if it is better beyond the noise.** If several are, the lowest margin error wins (then total error, then bias). Otherwise ridge stays, since it is the simplest and the easiest to explain.
+6. **A winner goes live** (Steve, October 30, 2026). Daily predictions switch to it, and charts are added that explain it: which inputs matter most, and how each one moves the score. The per-game breakdown (`explain`) adds up exactly only for a weighted sum, so for any other winner it becomes an approximation.
+7. **Luck.** Each comparison has about a 1 in 20 chance of passing by luck alone. Across seven, there's up to about a 1 in 4 chance that one passes even if none is truly better. The locked test season, scored once at the end, has the last word.
+8. **Also reported, not part of the rule:** each model's error on its own training games next to its error on the months it predicted. A wide gap means a model memorizes past games (overfits); two high numbers mean it misses the pattern (underfits).
+
+**What this test can't check.**
+- Other inputs. Flexible models might do better with the raw pieces of the formula (pace, offensive and defensive ratings) than with the formula's result. That would be a new question with its own test.
+- Settings outside the ranges above.
+
+**Result (October 30, 2026): ridge regression stays.** No other kind of model beat it beyond the noise. Full tables are in [results/comparison.md](../results/comparison.md).
+
+![Kinds of model against ridge regression](figures/model_comparison.png)
+
+- **The flexible models were worse, not better.** The neural network, gradient boosting, random forest, support vector regression and k-nearest neighbors all raised margin error, by 0.10 to 0.36 points, beyond the noise. Their total error rose too.
+- **Elastic net is ridge again.** Its most common pick was the smallest penalty tried, so it ended up nearly identical to ridge and tied (+0.004 on margin).
+- **The blend tied.** It leaned on ridge most (39%), then the random forest (19%), elastic net (18%) and the neural network (16%). Its margin error matched ridge within the noise, but its totals ran 0.65 points low on average. A tie keeps the simpler model.
+- **Why: the flexible models memorized past games.** Each fit its own training games better than ridge (the random forest's error there was 9.70 against ridge's 10.34) and new months worse (10.97 against 10.85). Ridge's own gap of 0.51 is the baseline any model pays because each new month differs a little from the past; a weighted sum of 8 inputs has almost nothing to memorize with. The wider gaps of the flexible models, 0.72 to 1.28, are noise they learned as if it were pattern.
+- **What it says about the model.** The same as decision 7's learning curve: the limit is the inputs, not the shape of the model. The pace x efficiency formula already holds the main interaction in these inputs, so trees and networks find little left to bend. Gains have to come from better inputs.
+- **Luck.** Nothing passed, so there is no lucky winner to worry about (point 7). The locked test season stays untouched.
+
+![Training and validation error by kind of model](figures/model_fit.png)

@@ -9,6 +9,7 @@
     python -m nbamodel evaluate         # cross-validation, tuning curves and Vegas benchmark
     python -m nbamodel evaluate --compare all   # plus with/without tables for each setting decision
     python -m nbamodel tune             # test the hand-picked settings one by one (decision 10)
+    python -m nbamodel compare          # other kinds of model against ridge regression (decision 11)
     python -m nbamodel injuries         # check what the injury report reader finds
     python -m nbamodel predict          # today's games with the latest injury report
     python -m nbamodel daily            # refresh this season's data, then predict
@@ -23,7 +24,7 @@ from datetime import date as date_cls
 
 import pandas as pd
 
-from . import config, data, evaluate, features, injuries, lineup, model, ratings, report, validate, vegas
+from . import compare, config, data, evaluate, features, injuries, lineup, model, ratings, report, validate, vegas
 from .names import normalize_name
 
 
@@ -316,6 +317,32 @@ def cmd_tune(args):
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(lines) + "\n")
     print("\n".join(lines[-len(summary) - 2:]))
+    print(f"Saved {out}")
+    cmd_report(args)
+
+
+def cmd_compare(args):
+    """Decision 11: other kinds of model against ridge regression, on the same inputs and validation
+    folds, with the noise test. Nothing in the model changes; results/comparison.md shows what the
+    test picked."""
+    seasons = [s for s in config.TRAIN_SEASONS if s < config.TEST_SEASON]
+    feats = evaluate.validation_rows(_historical(seasons))
+    print(f"Comparing {len(compare.CANDIDATES)} kinds of model and a blend, month by month (5 to 15 minutes)...")
+    lines, _ = compare.run(feats, config.VALIDATION_SEASONS)
+    k = config.NOISE_STANDARD_ERRORS
+    head = ["# Comparing kinds of model", "",
+            "Decision 11 in docs/decisions.md. Every model predicts each team's points from the same inputs as "
+            "ridge regression, on the same monthly folds of the validation seasons. In each fold it picks its own "
+            f"setting on the most recent {compare.INNER_SHARE:.0%} of the training games, then refits on all of "
+            "them. Changes are in average error against ridge on the same games; noise is "
+            f"{k} standard errors, measured month to month. A model replaces ridge only if it beats the noise "
+            "(margin error first, then total error) and doesn't move the average total more than "
+            f"{config.BIAS_GUARD_POINTS} points further from the actual. If several do, the lowest margin error "
+            "wins.", ""]
+    out = config.ROOT / "results" / "comparison.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(head + lines) + "\n")
+    print("\n".join(lines[:len(compare.CANDIDATES) + 7]))  # the table and the result
     print(f"Saved {out}")
     cmd_report(args)
 
@@ -635,6 +662,8 @@ def main(argv=None):
     inj.add_argument("--file", help="Read a downloaded injury report PDF instead of fetching the latest")
     sub.add_parser("tune", help="Test the hand-picked settings one by one (decision 10), "
                    "written to results/tuning.md")
+    sub.add_parser("compare", help="Other kinds of model against ridge regression (decision 11), "
+                   "written to results/comparison.md")
     sub.add_parser("report", help="Redraw the charts in docs/figures from results/ and data/model.json")
     p_explain = sub.add_parser("explain", help="Chart of how one game's prediction is built")
     p_explain.add_argument("--game", required=True, help="Either team's abbreviation, e.g. BOS")
@@ -664,6 +693,8 @@ def main(argv=None):
         cmd_evaluate(args)
     elif args.command == "tune":
         cmd_tune(args)
+    elif args.command == "compare":
+        cmd_compare(args)
     elif args.command == "injuries":
         cmd_injuries(args)
     elif args.command == "report":

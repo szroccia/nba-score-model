@@ -90,7 +90,11 @@ Each run also pulls every team's current roster. Players who have left a team ar
 - **Complexity and learning curves** for ridge strength and for how much history the model needs.
 - **Vegas benchmark.** Closing spreads and totals from ESPN's public API, compared game by game.
 
-Full tables are in [results/evaluation.md](results/evaluation.md). `python -m nbamodel backtest` gives a simpler season-by-season check in [results/backtest.md](results/backtest.md). In both, lineups use who actually played (historical injury reports are not kept) and player values use only the previous season's BPM, to avoid looking ahead.
+`python -m nbamodel compare` runs seven other kinds of model through the same months, each picking its own settings using only earlier games. None beat ridge regression:
+
+![Kinds of model against ridge regression](docs/figures/model_comparison.png)
+
+Full tables are in [results/evaluation.md](results/evaluation.md) and [results/comparison.md](results/comparison.md). `python -m nbamodel backtest` gives a simpler season-by-season check in [results/backtest.md](results/backtest.md). In both, lineups use who actually played (historical injury reports are not kept) and player values use only the previous season's BPM, to avoid looking ahead.
 
 ## Key decisions
 
@@ -103,6 +107,7 @@ Each is explained with its evidence in the [decision log](docs/decisions.md):
 - [Strength-of-schedule adjustment](docs/decisions.md#8-strength-of-schedule), kept because it beat a noise test fixed in advance
 - [Four factors](docs/decisions.md#9-four-factors), tested and left out: they helped totals but hurt margins
 - [Hand-picked settings tuned](docs/decisions.md#10-hand-picked-settings): 3 of 8 changed after a test fixed in advance, with longer memory for team ratings and player minutes
+- [Ridge regression kept over seven other kinds of model](docs/decisions.md#11-kinds-of-model): a neural network, gradient boosting, random forest and others fit past games better but predicted new months worse
 
 ## Data
 
@@ -134,6 +139,7 @@ python -m nbamodel backtest      # accuracy by season, writes results/backtest.m
 python -m nbamodel evaluate      # cross-validation, tuning curves, Vegas benchmark (results/evaluation.md)
 python -m nbamodel evaluate --compare all   # adds a with/without table for each setting decision
 python -m nbamodel tune          # tests the hand-picked settings one by one (results/tuning.md)
+python -m nbamodel compare       # other kinds of model against ridge regression (results/comparison.md)
 python -m nbamodel report        # redraw the charts in docs/figures
 python -m nbamodel predict       # today's games
 python -m nbamodel explain --game BOS   # chart of how one game's prediction is built
@@ -182,7 +188,7 @@ When a later run changes a prediction by a point or more, the change and the pla
 
 ## Limitations and ideas
 
-- The model is limited by its inputs rather than by data (see the [learning curve](docs/decisions.md#7-ridge-strength)), so richer features are the next step.
+- The model is limited by its inputs, not by data or the kind of model (see the [learning curve](docs/decisions.md#7-ridge-strength) and the [model comparison](docs/decisions.md#11-kinds-of-model)), so richer features are the next step.
 - Minutes for absent players are redistributed in proportion to usual minutes, not by position.
 - Rookies have no NBA minutes or BPM, so they count only once they start playing.
 - Box Plus/Minus misses defense that doesn't show up in the box score.

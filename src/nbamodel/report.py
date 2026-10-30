@@ -395,6 +395,74 @@ def tuning(tables: dict, out):
     return _save(fig, out)
 
 
+def model_comparison(table: pd.DataFrame, out):
+    """Decision 11: each kind of model's change in margin error against ridge regression, with the
+    noise. Best at the top; the model the test picks, if any, in orange."""
+    others = table[table["Verdict"] != "current"].sort_values("Margin change", ascending=False)
+    better = others[others["Verdict"] == "better"]
+    picked = better.sort_values(["Margin MAE", "Total MAE"])["Model"].iloc[0] if not better.empty else None
+    fig, ax = _figure(1, 9, 4.6)
+    _style(ax, "", grid_axis="x")
+    y = list(range(len(others)))
+    reach = max(float((others["Margin change"].abs() + others["Margin noise"]).max()), 0.1)
+    for yi, (_, r) in zip(y, others.iterrows()):
+        change, noise = float(r["Margin change"]), float(r["Margin noise"])
+        ax.plot([change - noise, change + noise], [yi, yi], color=GRAY, linewidth=6, solid_capstyle="butt")
+        ax.scatter([change], [yi], s=90, color=ORANGE if r["Model"] == picked else BLUE,
+                   edgecolor=SURFACE, linewidth=2, zorder=3)
+        # One column of labels right of every bar, so none sits on a bar or the zero line.
+        ax.annotate(f"{change:+.2f} ± {noise:.2f}  {r['Verdict']}", (reach * 1.12, yi),
+                    va="center", fontsize=9, color=INK)
+    ax.axvline(0, color=MUTED, linewidth=1)
+    ax.annotate("ridge regression", (0, len(others) - 0.25), xytext=(4, 0), textcoords="offset points",
+                fontsize=9, color=MUTED, va="center")
+    ax.set_xlim(-reach * 1.1, reach * 2.1)
+    ax.set_ylim(-0.6, len(others) + 0.05)
+    ax.set_yticks(y, others["Model"])
+    ax.tick_params(axis="y", labelcolor=INK)
+    ax.set_xlabel("Change in average margin error against ridge, points (below zero is better)",
+                  fontsize=9, color=MUTED)
+    games = int(others["Games"].iloc[0])
+    _headline(fig, f"{picked} beats ridge regression" if picked
+              else "No other kind of model beats ridge regression beyond the noise",
+              f"Same inputs, same {games:,} validation games; each model picks its own settings using only "
+              "earlier games. Gray bars are the noise (2 standard errors, month to month): a bar crossing "
+              "zero is a tie, and a tie keeps ridge.")
+    fig.subplots_adjust(left=0.24, right=0.97, top=0.76, bottom=0.14)
+    return _save(fig, out)
+
+
+def model_fit(table: pd.DataFrame, out):
+    """Decision 11: each model's error on the games it learned from against games it hadn't seen.
+    A long line means it memorized past games (overfits); both dots far right, it underfits."""
+    rows = table.sort_values("Margin MAE, validation", ascending=False)
+    fig, ax = _figure(1, 9, 4.4)
+    _style(ax, "", grid_axis="x")
+    y = list(range(len(rows)))
+    for yi, (_, r) in zip(y, rows.iterrows()):
+        train, val = float(r["Margin MAE, training"]), float(r["Margin MAE, validation"])
+        ax.plot([train, val], [yi, yi], color=GRAY, linewidth=2, zorder=1)
+        ax.scatter([train], [yi], s=80, facecolor=SURFACE, edgecolor=INK, linewidth=2, zorder=3)
+        ax.scatter([val], [yi], s=80, color=BLUE, edgecolor=SURFACE, linewidth=2, zorder=3)
+        ax.annotate(f"gap {float(r['Gap']):+.2f}", (max(train, val), yi), xytext=(8, 0), textcoords="offset points",
+                    va="center", fontsize=9, color=INK)
+    lo = float(rows[["Margin MAE, training", "Margin MAE, validation"]].min().min())
+    hi = float(rows[["Margin MAE, training", "Margin MAE, validation"]].max().max())
+    ax.set_xlim(lo - 0.1, hi + (hi - lo) * 0.25 + 0.15)
+    ax.set_ylim(-0.6, len(rows) - 0.4)
+    ax.set_yticks(y, rows["Model"])
+    ax.tick_params(axis="y", labelcolor=INK)
+    ax.set_xlabel("Average margin error, points", fontsize=9, color=MUTED)
+    ax.scatter([], [], s=80, facecolor=SURFACE, edgecolor=INK, linewidth=2, label="games it learned from")
+    ax.scatter([], [], s=80, color=BLUE, label="months it hadn't seen")
+    _legend(ax, loc="upper left", bbox_to_anchor=(0, -0.17), ncol=2)
+    _headline(fig, "How well each model fits past games, and new ones",
+              "Error on the games each month's model learned from, and on the month it predicted. A wide gap "
+              "means a model memorized noise in past games instead of learning the pattern.")
+    fig.subplots_adjust(left=0.24, right=0.95, top=0.76, bottom=0.27)
+    return _save(fig, out)
+
+
 def cv_scheme(out):
     """How evaluation splits time: rolling monthly folds on validation seasons, test season locked."""
     plt = _plt()
@@ -496,6 +564,10 @@ def run(fig_dir=None) -> list:
     made.append(cv_scheme(fig_dir / "evaluation_scheme.png"))
     if (results / "tuning.md").exists():
         made.append(tuning(read_tables(results / "tuning.md"), fig_dir / "tuning.png"))
+    if (results / "comparison.md").exists():
+        tables = read_tables(results / "comparison.md")
+        made.append(model_comparison(tables["Against ridge regression"], fig_dir / "model_comparison.png"))
+        made.append(model_fit(tables["Training and validation error"], fig_dir / "model_fit.png"))
     if (results / "evaluation.md").exists():
         tables = read_tables(results / "evaluation.md")
         if "Against the Vegas closing line" in tables:

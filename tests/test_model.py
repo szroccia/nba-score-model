@@ -861,3 +861,76 @@ def test_tune_keeps_a_winner_in_place_and_restores_config(monkeypatch, tmp_path)
     assert seen[-1] == 18                                      # later settings ran with the winner in place
     assert config.RATING_HALF_LIFE_GAMES == 12                 # config.py's value is restored
     assert (tmp_path / "docs" / "figures" / "tuning.png").stat().st_size > 10_000
+
+
+def test_compare_ridge_matches_the_evaluation(monkeypatch):
+    from nbamodel import compare, config, evaluate
+
+    monkeypatch.setattr(config, "TEST_SEASON", "2025-26")
+    feats = evaluate.validation_rows(_fake_features())
+    preds, _ = compare.run_folds(feats, ["2023-24", "2024-25"], compare.CANDIDATES[:1], log=lambda _: None)
+    ridge, _ = evaluate.cross_validate(feats, ["2023-24", "2024-25"])
+    assert evaluate.metrics(preds["Ridge regression"]) == pytest.approx(evaluate.metrics(ridge))
+
+
+def test_compare_picks_settings_on_earlier_games_only(monkeypatch):
+    from sklearn.linear_model import Ridge
+
+    from nbamodel import compare, config, evaluate
+
+    monkeypatch.setattr(config, "TEST_SEASON", "2025-26")
+    feats = evaluate.validation_rows(_fake_features())
+    seen = []
+
+    class Recorder(Ridge):
+        def fit(self, X, y):
+            seen.append(("fit", feats.loc[X.index, "GAME_DATE"].max()))
+            return super().fit(X, y)
+
+        def predict(self, X):
+            seen.append(("predict", feats.loc[X.index, "GAME_DATE"].min()))
+            return super().predict(X)
+
+    candidates = [compare.CANDIDATES[0], ("Recorder", "test", [("a", Recorder), ("b", lambda: Recorder(alpha=1e6))])]
+    _, folds = compare.run_folds(feats, ["2023-24"], candidates, log=lambda _: None)
+    month_starts = [pd.Period(f, "M").start_time for f in folds["fold"].unique()]
+    assert len(month_starts) == 7
+    # Every fold: two settings fit on the earlier games and scored on the recent fifth, then the
+    # pick refit on all training games; predictions on the month come only after that.
+    fits = [d for kind, d in seen if kind == "fit"]
+    assert len(fits) == 3 * len(month_starts)
+    for i, start in enumerate(month_starts):
+        assert all(d < start for d in fits[3 * i:3 * i + 3])
+    assert set(folds.loc[folds["model"] == "Recorder", "setting"]) == {"a"}  # the near-useless one never wins
+
+
+def test_compare_command_finds_a_model_that_beats_ridge(monkeypatch, tmp_path):
+    from sklearn.ensemble import HistGradientBoostingRegressor
+    from sklearn.neighbors import KNeighborsRegressor
+
+    from nbamodel import cli, compare, config, report
+
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "VALIDATION_SEASONS", ["2023-24", "2024-25"])
+    monkeypatch.setattr(config, "TEST_SEASON", "2025-26")
+    plain = _fake_features()
+    # A step that a straight line can't follow: a team with any lineup boost scores 8 more.
+    stepped = plain.assign(PTS=plain["PTS"] + 8 * (plain["LINEUP_OFF_PTS"] > 0))
+    monkeypatch.setattr(cli, "_historical", lambda seasons: stepped)
+    monkeypatch.setattr(compare, "CANDIDATES", [
+        compare.CANDIDATES[0],
+        ("k-nearest neighbors", "test", [("300 neighbors", lambda: compare._scaled(KNeighborsRegressor(300)))]),
+        ("Gradient boosting", "test", [("depth 2", lambda: HistGradientBoostingRegressor(max_depth=2, max_iter=50))]),
+    ])
+    cli.main(["compare"])
+    text = (tmp_path / "results" / "comparison.md").read_text()
+    assert "**Gradient boosting beats ridge regression.**" in text
+    tables = report.read_tables(tmp_path / "results" / "comparison.md")
+    verdicts = tables["Against ridge regression"].set_index("Model")["Verdict"]
+    assert verdicts["Ridge regression"] == "current"
+    assert verdicts["Gradient boosting"] == "better"
+    assert verdicts["k-nearest neighbors"] == "worse"
+    weights = tables["Blend weights"].set_index("Model")["Weight"]
+    assert weights["Gradient boosting"] > weights["k-nearest neighbors"]
+    for name in ("model_comparison", "model_fit"):
+        assert (tmp_path / "docs" / "figures" / f"{name}.png").stat().st_size > 10_000
